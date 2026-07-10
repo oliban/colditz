@@ -37,7 +37,12 @@
 #if !defined(PSP)
 #include "GL/glew.h"
 #endif
+#if defined(__APPLE__)
+// Use the native GLUT framework, as X11/GLX is broken on recent macOS
+#include <GLUT/glut.h>
+#else
 #include <GL/glut.h>
+#endif
 
 #include "low-level.h"
 #include "colditz.h"

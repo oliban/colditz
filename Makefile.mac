@@ -1,34 +1,33 @@
 TARGET          = colditz
 OBJS            = conf.o dictionary.o game.o graphics.o getopt.o iniparser.o low-level.o main.o md5.o soundplayer.o osx/audio_backend.o
-DEPS            = glut/libglut.a
 
 CC              = gcc
 LD              = gcc
 
-CFLAGS         += -I. -O3 -Wall -Wshadow -Wundef -Wunused
+GLEW_PREFIX     = $(shell brew --prefix glew 2>/dev/null || echo /usr/local)
+
+# Uses the native (deprecated, but still functional) GLUT and OpenGL frameworks
+# instead of freeglut/X11, as XQuartz GLX is broken on macOS 26 "Tahoe" and later.
+CFLAGS         += -I. -I$(GLEW_PREFIX)/include -O3 -Wall -Wshadow -Wundef -Wunused -Wno-deprecated-declarations
 CXXFLAGS       += $(CFLAGS) -fno-exceptions -fno-rtti
 
-LIBS           += -lfreeglut -lX11 -lXi -lXmu -lXext -lGL -lGLU -lGLEW -framework CoreFoundation -framework IOKit -framework CoreAudio -framework AudioUnit
-LIBDIRS        += -L./freeglut -L/opt/X11/lib
+LIBS           += -lGLEW -framework GLUT -framework OpenGL -framework CoreFoundation -framework IOKit -framework CoreAudio -framework AudioUnit
+LIBDIRS        += -L$(GLEW_PREFIX)/lib
 
-LDFLAGS        += $(LIBDIRS) $(LIBS) $(shell pkgconf --libs-only-L glew)
+LDFLAGS        += $(LIBDIRS) $(LIBS)
 
 .o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 all: $(TARGET)
 
-$(DEPS):
-	$(MAKE) -Cfreeglut libfreeglut.a
-
-$(TARGET): $(DEPS) $(OBJS)
+$(TARGET): $(OBJS)
 	$(LD) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
 clean:
 	$(RM) $(OBJS) $(TARGET)
 
 superclean: clean
-	$(MAKE) -Cfreeglut clean
 
 release: all
 	cp colditz "Colditz Escape"

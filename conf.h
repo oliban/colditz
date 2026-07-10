@@ -24,7 +24,12 @@
 #pragma once
 
 #include <stdbool.h>
+#if defined(__APPLE__)
+// Use the native GLUT framework, as X11/GLX is broken on recent macOS
+#include <GLUT/glut.h>
+#else
 #include <GL/glut.h>
+#endif
 
 #include "iniparser.h"
 

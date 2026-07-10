@@ -31,14 +31,15 @@ Then run:
 MacOS (XCode)
 ===========
 
-You should have XCode, XQuartz (which you can download from https://www.xquartz.org/)
-and GLEW installed. For XBox 360 Controller support, you should also install the latest
+You should have XCode and GLEW installed. The build uses the native (deprecated,
+but still functional) GLUT and OpenGL frameworks bundled with macOS, so XQuartz
+is NOT required. For XBox 360 Controller support, you should also install the latest
 360Controller package from https://github.com/360Controller/360Controller/releases.
-Note that if needed, you can install XQuartz and GLEW by running the following:
+Note that if needed, you can install GLEW by running the following:
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  brew install xquartz glew
+  brew install glew
 Once you have these prerequisites, simply run:
-  make release
+  make -f Makefile.mac release
 
 DIRECTORY STRUCTURE AND FILE DESCRIPTION:
 =========================================
