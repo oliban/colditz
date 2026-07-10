@@ -37,6 +37,14 @@ assert all(k in p for k in ('nation','room','x','y','fatigue','inventory','selec
 assert 'input_queue' in s
 EOF
 
+# 4. /screen is a real PNG
+curl -s -o /tmp/screen.png http://127.0.0.1:$PORT/screen
+python3 - <<'EOF' && pass "/screen PNG" || fail "/screen PNG"
+d = open('/tmp/screen.png','rb').read()
+assert d[:8] == b'\x89PNG\r\n\x1a\n', "bad magic"
+assert len(d) > 1000, "suspiciously small"
+EOF
+
 kill $PID 2>/dev/null
 rm -f "$GAMEDIR/colditz-test"
 exit $FAIL

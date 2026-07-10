@@ -5,8 +5,10 @@
 extern bool agent_api_enabled;
 void agent_api_init(uint16_t port);
 void agent_api_tick(void);
+void agent_api_capture(void);
 #else
 #define agent_api_enabled false
 #define agent_api_init(port)
 #define agent_api_tick()
+#define agent_api_capture()
 #endif

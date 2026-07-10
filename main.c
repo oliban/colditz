@@ -430,6 +430,7 @@ static void glut_display(void)
     rescale_buffer();
 #endif
 
+    agent_api_capture();
     glutSwapBuffers();
 }
 

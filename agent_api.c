@@ -12,8 +12,29 @@
 #include "colditz.h"   /* guybrush, p_event, game_state, props, game_time */
 #include "game.h"      /* guybrush[] extern */
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBI_WRITE_NO_STDIO
+#include "stb_image_write.h"
+#pragma GCC diagnostic pop
+
+#if defined(__APPLE__)
+#include <OpenGL/gl.h>
+#else
+#include <GL/gl.h>
+#endif
+
 bool agent_api_enabled = false;
 static int listen_fd = -1;
+
+/* Grow-on-demand buffer used by the stb PNG-encode write callback. Declared
+ * once at file scope (rather than duplicated locally in png_append and
+ * handle_screen) so both share the identical definition. */
+struct growbuf { uint8_t* p; size_t len, cap; };
+
+static uint8_t* frame_buf = NULL;
+static int frame_w = 0, frame_h = 0;
 
 void agent_api_init(uint16_t port)
 {
@@ -62,6 +83,71 @@ static void send_response(int cfd, int code, const char* ctype,
         if (w <= 0) break;
         off += (size_t)w;
     }
+}
+
+/* Captures the current GL front-buffer contents into frame_buf. Called once
+ * per rendered frame from glut_display(), right before the buffer swap.
+ * Costs nothing when the API is disabled. */
+void agent_api_capture(void)
+{
+    if (!agent_api_enabled) return;
+    /* Also re-allocate if a previous allocation attempt failed (frame_buf
+     * is NULL) even though the dimensions haven't changed, so a transient
+     * OOM doesn't permanently disable capture. */
+    if (frame_w != gl_width || frame_h != gl_height || !frame_buf) {
+        free(frame_buf);
+        frame_buf = malloc((size_t)gl_width * (size_t)gl_height * 3);
+        frame_w = gl_width; frame_h = gl_height;
+    }
+    if (!frame_buf) return;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, frame_w, frame_h, GL_RGB, GL_UNSIGNED_BYTE, frame_buf);
+}
+
+/* stb PNG-encode write callback: appends `size` bytes to the growbuf,
+ * growing it geometrically as needed. If realloc() fails, the partial
+ * buffer is freed and the growbuf reset to empty rather than left
+ * dangling/leaked; the caller (handle_screen) treats an empty growbuf as
+ * "encode failed" and responds 500 instead of crashing on a NULL body. */
+static void png_append(void* ctx, void* data, int size)
+{
+    struct growbuf *g = ctx;
+    if (size <= 0) return;
+    if (g->len + (size_t)size > g->cap) {
+        size_t newcap = (g->len + (size_t)size) * 2;
+        uint8_t* np = realloc(g->p, newcap);
+        if (!np) {
+            free(g->p);
+            g->p = NULL;
+            g->cap = 0;
+            g->len = 0;
+            return;
+        }
+        g->p = np;
+        g->cap = newcap;
+    }
+    if (!g->p) return;   /* prior allocation failure: drop remaining data */
+    memcpy(g->p + g->len, data, (size_t)size);
+    g->len += (size_t)size;
+}
+
+static void handle_screen(int cfd)
+{
+    struct growbuf g = { NULL, 0, 0 };
+    if (!frame_buf) {
+        send_response(cfd, 404, "text/plain", "no frame yet", 12);
+        return;
+    }
+    /* GL rows are bottom-up: point stb at the last row, negative stride,
+     * so the encoded PNG comes out top-down (right-side up). */
+    stbi_write_png_to_func(png_append, &g, frame_w, frame_h, 3,
+                           frame_buf + (size_t)(frame_h - 1) * frame_w * 3,
+                           -frame_w * 3);
+    if (g.p) {
+        send_response(cfd, 200, "image/png", g.p, g.len);
+        free(g.p);
+    } else
+        send_response(cfd, 500, "text/plain", "encode failed", 13);
 }
 
 /* Prop names indexed 0..NB_PROPS-1, matching the ITEM_* defines in colditz.h
@@ -191,6 +277,8 @@ static void handle_request(int cfd)
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/state"))
         handle_state(cfd);
+    else if (!strcmp(method, "GET") && !strcmp(path, "/screen"))
+        handle_screen(cfd);
     else
         send_response(cfd, 404, "text/plain", "not found", 9);
 }
