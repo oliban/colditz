@@ -63,6 +63,19 @@ X1=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys;s=json.l
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"key":"fly"}' http://127.0.0.1:$PORT/input)
 [ "$CODE" = "400" ] && pass "bad key 400s" || fail "bad key returned $CODE"
 
+# 7. pause freezes game_time
+curl -s -X POST -d '{"pause":true}' http://127.0.0.1:$PORT/control >/dev/null
+sleep 0.5
+T0=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys;print(json.load(sys.stdin)['game_time'])")
+sleep 1
+T1=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys;print(json.load(sys.stdin)['game_time'])")
+[ "$T0" = "$T1" ] && pass "pause freezes game_time" || fail "game_time advanced while paused ($T0 -> $T1)"
+curl -s -X POST -d '{"pause":false}' http://127.0.0.1:$PORT/control >/dev/null
+
+# 8. /say returns 200
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"text":"hello from the agent"}' http://127.0.0.1:$PORT/say)
+[ "$CODE" = "200" ] && pass "/say accepted" || fail "/say returned $CODE"
+
 kill $PID 2>/dev/null
 # Belt-and-suspenders teardown, matched by name rather than trusting $PID:
 # colditz-test is launched inside a subshell ("cd ... && ./colditz-test ..."

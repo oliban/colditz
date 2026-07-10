@@ -232,9 +232,28 @@ static long json_int(const char* body, const char* field, long dflt)
     return strtol(p+1, NULL, 10);
 }
 
+/* Appends one key press/hold to the input queue. Shared by handle_input
+ * (arbitrary named key) and handle_control (KEY_PAUSE toggle). Returns
+ * false, without touching the queue, if it's already full -- callers turn
+ * that into a 400 rather than silently dropping the request, since a
+ * silently-ignored /control pause would leave the caller believing the
+ * game paused when it didn't. */
+static bool enqueue_key(uint8_t code, int ms)
+{
+    int slot, ticks;
+    if (q_len >= INPUT_QUEUE_LEN) return false;
+    slot = (q_head + q_len) % INPUT_QUEUE_LEN;
+    ticks = ms / 16;
+    if (ticks < 1) ticks = 1;
+    input_q[slot].code = code;
+    input_q[slot].ticks = ticks;
+    q_len++;
+    return true;
+}
+
 static void handle_input(int cfd, const char* body)
 {
-    char name[24]; char resp[64]; uint8_t code; long ms; int slot, n;
+    char name[24]; char resp[64]; uint8_t code; long ms; int n;
     if (!body || !json_str(body, "key", name, sizeof(name))) {
         send_response(cfd, 400, "text/plain", "missing \"key\"", 13);
         return;
@@ -247,21 +266,63 @@ static void handle_input(int cfd, const char* body)
         send_response(cfd, 400, "text/plain", valid, strlen(valid));
         return;
     }
-    if (q_len >= INPUT_QUEUE_LEN) {
-        send_response(cfd, 400, "text/plain", "queue full", 10);
-        return;
-    }
     ms = json_int(body, "ms", 100);
     if (ms < 16) ms = 16;
     if (ms > 10000) ms = 10000;
-    slot = (q_head + q_len) % INPUT_QUEUE_LEN;
-    input_q[slot].code = code;
-    input_q[slot].ticks = (int)(ms / 16);
-    if (input_q[slot].ticks < 1) input_q[slot].ticks = 1;
-    q_len++;
+    if (!enqueue_key(code, (int)ms)) {
+        send_response(cfd, 400, "text/plain", "queue full", 10);
+        return;
+    }
     n = snprintf(resp, sizeof(resp), "{\"queued\":%d}",
                  agent_input_queue_depth());
     send_response(cfd, 202, "application/json", resp, n);
+}
+
+/* POST /control {"pause":bool} -> 200 {"paused":bool}. Idempotent: if the
+ * game is already in the requested state, no key is injected (the `want !=
+ * paused` guard below), so repeated identical calls never toggle it back
+ * out. Pausing/unpausing goes through the game's own KEY_PAUSE key path
+ * (via enqueue_key/input_pump, same mechanism as /input) rather than
+ * poking game_state directly, so it stays in sync with everything else
+ * the real key binding does (picture-fade, pause-screen render, etc).
+ * See docs/AGENT-API.md for the resulting display caveat. */
+static void handle_control(int cfd, const char* body)
+{
+    char resp[48]; int n; const char* p; bool want;
+    if (!body || !(p = strstr(body, "\"pause\""))) {
+        send_response(cfd, 400, "text/plain", "expected \"pause\"", 17);
+        return;
+    }
+    want = (strstr(p, "true") != NULL);
+    if (want != (paused ? true : false)) {
+        if (!enqueue_key(KEY_PAUSE, 100)) {
+            send_response(cfd, 400, "text/plain", "queue full", 10);
+            return;
+        }
+    }
+    n = snprintf(resp, sizeof(resp), "{\"paused\":%s}", want?"true":"false");
+    send_response(cfd, 200, "application/json", resp, n);
+}
+
+/* POST /say {"text":"..."} -> 200. Displays `text` on the in-game status
+ * bar via set_status_message(), which stores the POINTER it's given (it
+ * doesn't copy) -- hence the persistent static buffer below rather than a
+ * stack temporary. Priority 3 matches the highest priority used by any
+ * existing call site (game.c debug/cheat messages; see game.h:89-96,
+ * set_status_message only overwrites when priority >= current), so an
+ * agent's commentary always wins over routine room/props messages instead
+ * of being silently dropped by set_status_message's priority gate. The
+ * game font renders plain ASCII; non-ASCII bytes in `text` are passed
+ * through as-is (not stripped) -- see docs/AGENT-API.md. */
+static char say_buf[128];
+static void handle_say(int cfd, const char* body)
+{
+    if (!body || !json_str(body, "text", say_buf, sizeof(say_buf))) {
+        send_response(cfd, 400, "text/plain", "missing \"text\"", 14);
+        return;
+    }
+    set_status_message(say_buf, 3, 4000);
+    send_response(cfd, 200, "application/json", "{\"ok\":true}", 11);
 }
 
 /* Called every tick from agent_api_tick(): advance the input machine. */
@@ -392,6 +453,14 @@ static void handle_request(int cfd)
         char* hdr_end = strstr(req_buf, "\r\n\r\n");
         char* body = hdr_end ? hdr_end + 4 : NULL;
         handle_input(cfd, body);
+    } else if (!strcmp(method, "POST") && !strcmp(path, "/control")) {
+        char* hdr_end = strstr(req_buf, "\r\n\r\n");
+        char* body = hdr_end ? hdr_end + 4 : NULL;
+        handle_control(cfd, body);
+    } else if (!strcmp(method, "POST") && !strcmp(path, "/say")) {
+        char* hdr_end = strstr(req_buf, "\r\n\r\n");
+        char* body = hdr_end ? hdr_end + 4 : NULL;
+        handle_say(cfd, body);
     } else
         send_response(cfd, 404, "text/plain", "not found", 9);
 }

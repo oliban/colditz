@@ -40,6 +40,7 @@ Note that if needed, you can install GLEW by running the following:
   brew install glew
 Once you have these prerequisites, simply run:
   make -f Makefile.mac release
+The -a <port> option enables the agent HTTP API (see docs/AGENT-API.md).
 
 DIRECTORY STRUCTURE AND FILE DESCRIPTION:
 =========================================
