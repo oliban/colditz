@@ -24,6 +24,19 @@ python3 -c "import json;json.load(open('/tmp/state.json'))" 2>/dev/null \
 CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/nope)
 [ "$CODE" = "404" ] && pass "unknown path 404s" || fail "unknown path returned $CODE"
 
+# 3. /state has real game fields
+python3 - <<'EOF' && pass "/state schema" || fail "/state schema"
+import json
+s = json.load(open('/tmp/state.json'))
+assert isinstance(s['game_time'], int)
+assert isinstance(s['paused'], bool)
+assert s['current_prisoner'] in (0,1,2,3)
+assert len(s['prisoners']) == 4
+p = s['prisoners'][s['current_prisoner']]
+assert all(k in p for k in ('nation','room','x','y','fatigue','inventory','selected'))
+assert 'input_queue' in s
+EOF
+
 kill $PID 2>/dev/null
 rm -f "$GAMEDIR/colditz-test"
 exit $FAIL

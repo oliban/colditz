@@ -2,12 +2,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/time.h>
 #include "agent_api.h"
+#include "colditz.h"   /* guybrush, p_event, game_state, props, game_time */
+#include "game.h"      /* guybrush[] extern */
+#include "conf.h"      /* KEY_* binding macros (needs config dictionary) */
 
 bool agent_api_enabled = false;
 static int listen_fd = -1;
@@ -61,10 +65,118 @@ static void send_response(int fd, int code, const char* ctype,
     }
 }
 
+/* Prop names indexed 0..NB_PROPS-1, matching the ITEM_* defines in colditz.h
+ * exactly (verified against colditz.h:228-247; NB_PROPS is 16). */
+static const char* prop_name[NB_PROPS] = {
+    "none",               /* ITEM_NONE               0x00 */
+    "lockpick",           /* ITEM_LOCKPICK            0x01 */
+    "key_one",            /* ITEM_KEY_ONE             0x02 */
+    "key_two",            /* ITEM_KEY_TWO             0x03 */
+    "prisoner_uniform",   /* ITEM_PRISONERS_UNIFORM   0x04 */
+    "guard_uniform",      /* ITEM_GUARDS_UNIFORM      0x05 */
+    "pass",                /* ITEM_PASS               0x06 */
+    "shovel",              /* ITEM_SHOVEL             0x07 */
+    "pickaxe",             /* ITEM_PICKAXE            0x08 */
+    "saw",                 /* ITEM_SAW                0x09 */
+    "rifle",               /* ITEM_RIFLE              0x0A */
+    "stone",               /* ITEM_STONE              0x0B */
+    "candle",               /* ITEM_CANDLE            0x0C */
+    "papers",               /* ITEM_PAPERS            0x0D */
+    "stethoscope",          /* ITEM_STETHOSCOPE       0x0E */
+    "inflatable_dummy",     /* ITEM_INFLATABLE_DUMMY  0x0F */
+};
+
+static const char* nation_name[NB_NATIONS] = { "british", "french", "american", "polish" };
+
+static int agent_input_queue_depth(void) { return 0; }  /* real in Task 4 */
+
+/* Status bar text, JSON-sanitized. Exported directly as `status_message`
+ * (colditz.h:745: extern char *status_message;) -- no accessor needed. */
+static const char* agent_status_message(void)
+{
+    static char clean[128];
+    const char* s = status_message ? status_message : "";
+    int i;
+    for (i = 0; s[i] && i < 127; i++)
+        clean[i] = (s[i]=='"' || s[i]=='\\' || (unsigned char)s[i]<0x20)
+                   ? ' ' : s[i];
+    clean[i] = '\0';
+    return clean;
+}
+
+/* Appends to buf at offset n, clamped to bufsz. snprintf's return value is
+ * the length it WOULD have written on truncation, which is unbounded by
+ * bufsz; blindly doing `n += snprintf(...)` lets n exceed bufsz, and a
+ * later `bufsz - n` (both size_t/int mixed) wraps to a huge unsigned value
+ * feeding straight back into snprintf's size argument -- an out-of-bounds
+ * write. This clamps n to never exceed bufsz, so buf+n is always at worst
+ * one-past-the-end (never dereferenced) and remaining size is always >= 0. */
+static int json_append(char* buf, size_t bufsz, int n, const char* fmt, ...)
+{
+    size_t remain;
+    int w;
+    va_list ap;
+    if (n < 0 || (size_t)n >= bufsz)
+        return (int)bufsz;             /* already full */
+    remain = bufsz - (size_t)n;
+    va_start(ap, fmt);
+    w = vsnprintf(buf + n, remain, fmt, ap);
+    va_end(ap);
+    if (w < 0)
+        return n;                      /* encoding error: no progress */
+    if ((size_t)w >= remain)
+        return (int)bufsz;             /* truncated: treat buffer as full */
+    return n + w;
+}
+
+static int json_prisoner(char* p, size_t sz, int i)
+{
+    int n = 0, j;
+    bool first;
+    n = json_append(p, sz, n,
+        "{\"nation\":\"%s\",\"room\":%d,\"x\":%d,\"y\":%d,"
+        "\"direction\":%d,\"speed\":%d,\"state_flags\":%u,"
+        "\"dressed_as_guard\":%s,\"fatigue\":%u,\"escaped\":%s,\"dead\":%s,"
+        "\"inventory\":{",
+        nation_name[i], guybrush[i].room, guybrush[i].px, guybrush[i].p2y/2,
+        guybrush[i].direction, guybrush[i].speed, (unsigned)guybrush[i].state,
+        guybrush[i].is_dressed_as_guard?"true":"false",
+        (unsigned)p_event[i].fatigue, p_event[i].escaped?"true":"false",
+        p_event[i].killed?"true":"false");
+    first = true;
+    for (j = 1; j < NB_PROPS; j++)
+        if (props[i][j] > 0) {
+            n = json_append(p, sz, n, "%s\"%s\":%u", first?"":",",
+                             prop_name[j], (unsigned)props[i][j]);
+            first = false;
+        }
+    n = json_append(p, sz, n, "},\"selected\":\"%s\"}",
+                     prop_name[selected_prop[i]]);
+    return n;
+}
+
 static void handle_state(int fd)
 {
-    const char* json = "{\"ok\":true}";
-    send_response(fd, 200, "application/json", json, strlen(json));
+    static char json[8192];
+    int n = 0, i;
+    n = json_append(json, sizeof(json), n,
+        "{\"game_time\":%llu,\"paused\":%s,\"menu\":%s,\"intro\":%s,"
+        "\"current_prisoner\":%u,\"input_queue\":%d,\"prisoners\":[",
+        (unsigned long long)game_time, paused?"true":"false",
+        game_menu?"true":"false", intro?"true":"false",
+        (unsigned)current_nation, agent_input_queue_depth());
+    for (i = 0; i < NB_NATIONS; i++) {
+        if (i)
+            n = json_append(json, sizeof(json), n, ",");
+        /* json_prisoner writes directly into the remaining tail of `json`
+         * (sized to exactly what's left) and internally clamps via
+         * json_append, so n + its return value can never exceed
+         * sizeof(json). */
+        n += json_prisoner(json+n, sizeof(json)-(size_t)n, i);
+    }
+    n = json_append(json, sizeof(json), n, "],\"message\":\"%s\"}",
+                     agent_status_message());
+    send_response(fd, 200, "application/json", json, (size_t)n);
 }
 
 static void handle_request(int fd)
