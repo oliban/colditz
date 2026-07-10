@@ -11,7 +11,6 @@
 #include "agent_api.h"
 #include "colditz.h"   /* guybrush, p_event, game_state, props, game_time */
 #include "game.h"      /* guybrush[] extern */
-#include "conf.h"      /* KEY_* binding macros (needs config dictionary) */
 
 bool agent_api_enabled = false;
 static int listen_fd = -1;
@@ -40,7 +39,7 @@ void agent_api_init(uint16_t port)
     printf("agent_api: listening on 127.0.0.1:%u\n", port);
 }
 
-static void send_response(int fd, int code, const char* ctype,
+static void send_response(int cfd, int code, const char* ctype,
                           const void* body, size_t len)
 {
     char hdr[256];
@@ -53,13 +52,13 @@ static void send_response(int fd, int code, const char* ctype,
     if (n >= (int)sizeof(hdr)) n = (int)sizeof(hdr) - 1;
     size_t hdr_off = 0;
     while (hdr_off < (size_t)n) {
-        ssize_t w = write(fd, hdr + hdr_off, n - hdr_off);
+        ssize_t w = write(cfd, hdr + hdr_off, n - hdr_off);
         if (w <= 0) break;
         hdr_off += (size_t)w;
     }
     size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, (const char*)body + off, len - off);
+        ssize_t w = write(cfd, (const char*)body + off, len - off);
         if (w <= 0) break;
         off += (size_t)w;
     }
@@ -155,7 +154,7 @@ static int json_prisoner(char* p, size_t sz, int i)
     return n;
 }
 
-static void handle_state(int fd)
+static void handle_state(int cfd)
 {
     static char json[8192];
     int n = 0, i;
@@ -176,36 +175,36 @@ static void handle_state(int fd)
     }
     n = json_append(json, sizeof(json), n, "],\"message\":\"%s\"}",
                      agent_status_message());
-    send_response(fd, 200, "application/json", json, (size_t)n);
+    send_response(cfd, 200, "application/json", json, (size_t)n);
 }
 
-static void handle_request(int fd)
+static void handle_request(int cfd)
 {
     static char req_buf[4096];
     char method[8] = "", path[64] = "";
-    ssize_t n = recv(fd, req_buf, sizeof(req_buf) - 1, 0);
+    ssize_t n = recv(cfd, req_buf, sizeof(req_buf) - 1, 0);
     if (n <= 0) return;
     req_buf[n] = '\0';
     if (sscanf(req_buf, "%7s %63s", method, path) != 2) {
-        send_response(fd, 400, "text/plain", "bad request", 11);
+        send_response(cfd, 400, "text/plain", "bad request", 11);
         return;
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/state"))
-        handle_state(fd);
+        handle_state(cfd);
     else
-        send_response(fd, 404, "text/plain", "not found", 9);
+        send_response(cfd, 404, "text/plain", "not found", 9);
 }
 
 void agent_api_tick(void)
 {
     struct timeval tv = { 0, 200000 };  // 200 ms cap per request
-    int fd;
+    int cfd;
     if (listen_fd < 0) return;
-    fd = accept(listen_fd, NULL, NULL);
-    if (fd < 0) return;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    handle_request(fd);
-    close(fd);
+    cfd = accept(listen_fd, NULL, NULL);
+    if (cfd < 0) return;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    handle_request(cfd);
+    close(cfd);
 }
 #endif
