@@ -1,5 +1,5 @@
 TARGET          = colditz
-OBJS            = conf.o dictionary.o game.o graphics.o getopt.o iniparser.o low-level.o main.o md5.o soundplayer.o osx/audio_backend.o
+OBJS            = conf.o dictionary.o game.o graphics.o getopt.o iniparser.o low-level.o main.o md5.o soundplayer.o agent_api.o osx/audio_backend.o
 
 CC              = gcc
 LD              = gcc

@@ -52,6 +52,7 @@
 #include "soundplayer.h"
 #include "conf.h"
 #include "anti-tampering.h"
+#include "agent_api.h"
 
 // Global variables
 
@@ -80,6 +81,8 @@ bool opt_play_as_the_safe[NB_NATIONS]
 bool opt_meh					= false;
 // Use half size (i.e. original) resolution on Windows
 bool opt_halfsize				= false;
+// Agent API listen port (0 = disabled)
+static uint16_t opt_agent_port			= 0;
 // Who needs keys?
 bool opt_keymaster				= false;
 // "'coz this is triller!..."
@@ -1593,6 +1596,14 @@ static void glut_joystick(unsigned int buttonMask, int x, int y, int z)
 #define SET_MODS
 #endif
 
+#if !defined(WIN32) && !defined(PSP)
+static void glut_agent_timer(int value)
+{
+    agent_api_tick();
+    glutTimerFunc(16, glut_agent_timer, value);
+}
+#endif
+
 static void glut_keyboard(uint8_t key, int x, int y)
 {
     key_down[key] = true;
@@ -1664,10 +1675,10 @@ int main (int argc, char *argv[])
 #endif
 {
 #if defined(DEBUG_ENABLED)
-    const char* getopt_str = "hbnvs:";
+    const char* getopt_str = "hbnvs:a:";
     const char* usage = "[-h][-b][-n][-v][-s <sprite_id>]";
 #else
-    const char* getopt_str = "hnv";
+    const char* getopt_str = "hnva:";
     const char* usage = "[-h][-n][-v]";
 #endif
     // Flags
@@ -1705,6 +1716,10 @@ int main (int argc, char *argv[])
         case 'h':		// Half size
             opt_halfsize = true;
             break;
+        case 'a':		// Agent API port
+            opt_agent_port = (uint16_t)atoi(optarg);
+            if (opt_agent_port == 0) opt_agent_port = 8765;
+            break;
         default:		// Unknown option
             opt_error++;
             break;
@@ -1737,6 +1752,15 @@ int main (int argc, char *argv[])
 
     // Need to have a working GL before we proceed. This is our own init() function
     glut_init();
+
+#if !defined(WIN32) && !defined(PSP)
+    if (opt_agent_port != 0)
+    {
+        agent_api_init(opt_agent_port);
+        if (agent_api_enabled)
+            glutTimerFunc(16, glut_agent_timer, 0);
+    }
+#endif
 
 //	remove(confname);
     if (!read_conf(confname))

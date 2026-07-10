@@ -1,5 +1,5 @@
 TARGET          = colditz
-OBJS            = conf.o dictionary.o game.o graphics.o getopt.o iniparser.o low-level.o main.o md5.o soundplayer.o linux/audio_backend.o
+OBJS            = conf.o dictionary.o game.o graphics.o getopt.o iniparser.o low-level.o main.o md5.o soundplayer.o agent_api.o linux/audio_backend.o
 DEPS            = glut/libglut.a
 
 CC              = gcc
