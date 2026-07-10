@@ -201,6 +201,7 @@ static const char* nation_name[NB_NATIONS] = { "british", "french", "american", 
  * read/write these directly, and input_pump() below drives them the same
  * way a real keypress/key-release would. */
 extern bool key_down[256], key_readonce[256];
+extern uint8_t last_key_used;
 
 #define INPUT_QUEUE_LEN 32
 static struct { uint8_t code; int ticks; } input_q[INPUT_QUEUE_LEN];
@@ -366,6 +367,7 @@ static void input_pump(void)
         q_head = (q_head + 1) % INPUT_QUEUE_LEN;
         q_len--;
         key_down[active_code] = true;        /* press, like glut_keyboard */
+        last_key_used = active_code;         /* intro/menus exit on this */
     }
 }
 
