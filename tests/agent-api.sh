@@ -120,6 +120,50 @@ if [ "$W" = "arrived" ] || [ "$ROOM1" != "$ROOM0" ]; then pass "/walk completed 
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"tile":[999,999]}' http://127.0.0.1:$PORT/walk)
 [ "$CODE" = "400" ] && pass "/walk 400 on out-of-bounds" || fail "/walk oob returned $CODE"
 
+# 12. /walk cancel: cancelling a walk in progress returns 200 and /state
+# settles back to "idle" rather than leaving the pump running or the walk
+# stuck in some other terminal state.
+ROOMJSON=$(curl -s http://127.0.0.1:$PORT/room)
+FAR_TILE=$(echo "$ROOMJSON" | python3 -c "
+import json,sys
+r = json.load(sys.stdin)
+tx, ty = r['my_tile']
+best, bestd = None, -1
+for y, row in enumerate(r['grid']):
+    for x, c in enumerate(row):
+        if c in ('#', 'E') and (x, y) != (tx, ty):
+            d = abs(x - tx) + abs(y - ty)
+            if d > bestd:
+                bestd, best = d, (x, y)
+print(f'{best[0]},{best[1]}' if best else '')
+")
+if [ -n "$FAR_TILE" ]; then
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d "{\"tile\":[${FAR_TILE%,*},${FAR_TILE#*,}]}" http://127.0.0.1:$PORT/walk)
+  CODE2=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"cancel":true}' http://127.0.0.1:$PORT/walk)
+  [ "$CODE2" = "200" ] && pass "/walk cancel accepted" || fail "/walk cancel returned $CODE2 (walk start was $CODE)"
+  W=""
+  for i in $(seq 1 20); do
+    W=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['walk'])")
+    [ "$W" = "idle" ] && break
+    sleep 0.2
+  done
+  [ "$W" = "idle" ] && pass "/walk cancel settles to idle" || fail "/walk cancel left walk='$W'"
+else
+  fail "/walk cancel: no far walkable tile found to test with"
+fi
+
+# 13. /walk to (0,0) -- plausibly void/unreachable in the start room -- must
+# reject (400 bad target, or 409 no path) rather than 202/500, and the
+# server must keep serving requests afterwards.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"tile":[0,0]}' http://127.0.0.1:$PORT/walk)
+if [ "$CODE" = "400" ] || [ "$CODE" = "409" ]; then
+  pass "/walk (0,0) rejected ($CODE)"
+else
+  fail "/walk (0,0) returned $CODE"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/state)
+[ "$CODE" = "200" ] && pass "/state still responds after /walk (0,0)" || fail "/state returned $CODE after /walk (0,0)"
+
 kill $PID 2>/dev/null
 # Belt-and-suspenders teardown, matched by name rather than trusting $PID:
 # colditz-test is launched inside a subshell ("cd ... && ./colditz-test ..."

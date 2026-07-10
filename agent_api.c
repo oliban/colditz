@@ -725,9 +725,13 @@ enum { WALK_SNAP_OK = 0, WALK_SNAP_NO_ROOM, WALK_SNAP_BAD_EXIT };
 
 /* Snapshots the CURRENT room's walkable floor into walk_grid_walkable[]
  * (identical fair-play floor test to /room: any nonzero tile id, via the
- * same readtile() macro -- never door/exit status), and optionally
- * resolves the exit_index'th exit cell (in the same y-then-x scan order
- * /room's own exits array uses) into (*exit_x,*exit_y) when exit_index>=0.
+ * same readtile() macro, OR'd with an exit cell (readexit(x,y) & 0x1F)
+ * so exit tiles are walkable even over a void (id 0) tile -- mirroring
+ * /room's grid, which marks 'E' over void cells the same way. Only the
+ * exit index's low 5 bits' nonzero-ness is read, never door/exit status
+ * such as locked/grade), and optionally resolves the exit_index'th exit
+ * cell (in the same y-then-x scan order /room's own exits array uses)
+ * into (*exit_x,*exit_y) when exit_index>=0.
  * Mirrors handle_room's save/restore-around-set_room_xy pattern exactly
  * (see its comment) -- room_x/room_y/offset are always restored before
  * returning, on every path, so this never disturbs engine bookkeeping the
@@ -760,7 +764,8 @@ static int walk_snapshot_grid(uint16_t* out_width, uint16_t* out_height,
 
     for (y = 0; y < (int)height; y++) {
         for (x = 0; x < (int)width; x++) {
-            walk_grid_walkable[y*(int)width + x] = readtile(x, y) != 0;
+            walk_grid_walkable[y*(int)width + x] =
+                (readtile(x, y) != 0) || ((readexit(x, y) & 0x1F) != 0);
             if (exit_index >= 0 && !found_exit &&
                 (readexit(x, y) & 0x1F) != 0) {
                 if (seen == exit_index) {
@@ -972,20 +977,28 @@ static void handle_walk(int cfd, const char* body)
     }
 
     if (snap == WALK_SNAP_NO_ROOM) {
-        send_response(cfd, 400, "text/plain", "room data unavailable", 22);
+        static const char* unavail = "room data unavailable";
+        send_response(cfd, 400, "text/plain", unavail, strlen(unavail));
         return;
     }
     if (snap == WALK_SNAP_BAD_EXIT) {
-        send_response(cfd, 400, "text/plain", "invalid exit index", 19);
+        static const char* badexit = "invalid exit index";
+        send_response(cfd, 400, "text/plain", badexit, strlen(badexit));
         return;
     }
 
     if (tx < 0 || ty < 0 || tx >= (int16_t)width || ty >= (int16_t)height) {
-        send_response(cfd, 400, "text/plain", "tile out of bounds", 19);
+        static const char* oob = "tile out of bounds";
+        send_response(cfd, 400, "text/plain", oob, strlen(oob));
         return;
     }
+    /* walk_grid_walkable already folds in exit cells (readexit & 0x1F) even
+     * when the underlying tile id is 0 -- see walk_snapshot_grid -- so an
+     * {"exit":N} target that lands on a void tile is still accepted here,
+     * matching /room's 'E' overlay on void cells. */
     if (!walk_grid_walkable[(int)ty*(int)width + tx]) {
-        send_response(cfd, 400, "text/plain", "target is void tile", 20);
+        static const char* voidtile = "target is void tile";
+        send_response(cfd, 400, "text/plain", voidtile, strlen(voidtile));
         return;
     }
 
