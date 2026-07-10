@@ -2,9 +2,9 @@
 
 An HTTP API embedded in the game process, letting an AI agent perceive the
 screen, read game state, and send inputs while a human watches the normal
-game window. Off by default; enabled with `-a [port]` (default 8765 if the
-port argument is omitted or invalid). The server binds to **127.0.0.1
-only** — it is not reachable from the network.
+game window. Off by default; enabled with `-a <port>` (the port argument is
+required by getopt; an invalid or zero value falls back to 8765). The server
+binds to **127.0.0.1 only** — it is not reachable from the network.
 
 Design background: `docs/superpowers/specs/2026-07-10-agent-api-design.md`.
 
@@ -20,8 +20,11 @@ Design background: `docs/superpowers/specs/2026-07-10-agent-api-design.md`.
 
 Errors: malformed/missing JSON fields → 400 with a reason; unknown endpoint
 → 404; unknown key name → 400 listing valid names. Requests are capped at
-4 KB and one request is serviced per ~16 ms tick, so a misbehaving client
-can only slow itself, never the game loop.
+4 KB and one request is serviced per ~16 ms tick, with a 200 ms recv timeout
+and a 400 ms deadline on writing the response, so a misbehaving client can
+stall the game loop by at most ~0.4 s per request; a client that repeatedly
+connects and stalls can hold the game to a few fps for the duration, but can
+never crash or block it permanently.
 
 ## curl examples
 
@@ -88,3 +91,7 @@ curl -s -X POST -d '{"key":"right","ms":500}' localhost:8765/input
   whatever is currently on the status bar (including agent commentary set
   via `/say`) through the existing JSON string sanitizer, so no additional
   escaping was needed for this endpoint.
+- While the game is paused, `game_time` is frozen, so a `/say` message's
+  4-second timeout doesn't tick down — the game's own lower-priority status
+  messages stay suppressed until about 4 seconds of *game* time after
+  unpausing, not 4 seconds of wall-clock time.

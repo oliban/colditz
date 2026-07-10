@@ -61,33 +61,56 @@ void agent_api_init(uint16_t port)
     printf("agent_api: listening on 127.0.0.1:%u\n", port);
 }
 
+/* Milliseconds elapsed since t0, per gettimeofday(). Used to bound the
+ * total wall-clock time send_response() spends writing, so a client that
+ * drip-reads (SO_SNDTIMEO only caps each individual write() call, not the
+ * sum of many small successful ones) can't stall the GLUT loop. */
+static long ms_since(const struct timeval* t0)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (now.tv_sec - t0->tv_sec) * 1000L +
+           (now.tv_usec - t0->tv_usec) / 1000L;
+}
+
+#define SEND_RESPONSE_DEADLINE_MS 400
+
 static void send_response(int cfd, int code, const char* ctype,
                           const void* body, size_t len)
 {
     char hdr[256];
-    const char* msg = (code==200)?"OK":(code==400)?"Bad Request":
-                      (code==404)?"Not Found":"Error";
+    struct timeval t0;
+    const char* msg = (code==200)?"OK":(code==202)?"Accepted":
+                      (code==400)?"Bad Request":(code==404)?"Not Found":
+                      (code==500)?"Internal Server Error":"Error";
     int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.0 %d %s\r\nContent-Type: %s\r\n"
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
         code, msg, ctype, len);
+    if (n < 0) return;
     if (n >= (int)sizeof(hdr)) n = (int)sizeof(hdr) - 1;
+    gettimeofday(&t0, NULL);
     size_t hdr_off = 0;
     while (hdr_off < (size_t)n) {
-        ssize_t w = write(cfd, hdr + hdr_off, n - hdr_off);
+        ssize_t w;
+        if (ms_since(&t0) > SEND_RESPONSE_DEADLINE_MS) break;
+        w = write(cfd, hdr + hdr_off, n - hdr_off);
         if (w <= 0) break;
         hdr_off += (size_t)w;
     }
     size_t off = 0;
     while (off < len) {
-        ssize_t w = write(cfd, (const char*)body + off, len - off);
+        ssize_t w;
+        if (ms_since(&t0) > SEND_RESPONSE_DEADLINE_MS) break;
+        w = write(cfd, (const char*)body + off, len - off);
         if (w <= 0) break;
         off += (size_t)w;
     }
 }
 
-/* Captures the current GL front-buffer contents into frame_buf. Called once
- * per rendered frame from glut_display(), right before the buffer swap.
+/* Captures the current GL back-buffer contents into frame_buf. Called once
+ * per rendered frame from glut_display(), right before glutSwapBuffers(),
+ * so what's read here is still the back buffer (not yet promoted to front).
  * Costs nothing when the API is disabled. */
 void agent_api_capture(void)
 {
@@ -288,9 +311,10 @@ static void handle_input(int cfd, const char* body)
  * See docs/AGENT-API.md for the resulting display caveat. */
 static void handle_control(int cfd, const char* body)
 {
+    static const char* need_pause = "expected \"pause\"";
     char resp[48]; int n; const char* p; bool want;
     if (!body || !(p = strstr(body, "\"pause\""))) {
-        send_response(cfd, 400, "text/plain", "expected \"pause\"", 17);
+        send_response(cfd, 400, "text/plain", need_pause, strlen(need_pause));
         return;
     }
     want = (strstr(p, "true") != NULL);
