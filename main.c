@@ -82,7 +82,9 @@ bool opt_meh					= false;
 // Use half size (i.e. original) resolution on Windows
 bool opt_halfsize				= false;
 // Agent API listen port (0 = disabled)
+#if !defined(WIN32) && !defined(PSP)
 static uint16_t opt_agent_port			= 0;
+#endif
 // Who needs keys?
 bool opt_keymaster				= false;
 // "'coz this is triller!..."
@@ -1675,11 +1677,21 @@ int main (int argc, char *argv[])
 #endif
 {
 #if defined(DEBUG_ENABLED)
+#if !defined(WIN32) && !defined(PSP)
     const char* getopt_str = "hbnvs:a:";
-    const char* usage = "[-h][-b][-n][-v][-s <sprite_id>]";
+    const char* usage = "[-h][-b][-n][-v][-s <sprite_id>][-a port]";
 #else
+    const char* getopt_str = "hbnvs:";
+    const char* usage = "[-h][-b][-n][-v][-s <sprite_id>]";
+#endif
+#else
+#if !defined(WIN32) && !defined(PSP)
     const char* getopt_str = "hnva:";
+    const char* usage = "[-h][-n][-v][-a port]";
+#else
+    const char* getopt_str = "hnv";
     const char* usage = "[-h][-n][-v]";
+#endif
 #endif
     // Flags
     int opt_error = 0;	// getopt
@@ -1716,10 +1728,12 @@ int main (int argc, char *argv[])
         case 'h':		// Half size
             opt_halfsize = true;
             break;
+#if !defined(WIN32) && !defined(PSP)
         case 'a':		// Agent API port
             opt_agent_port = (uint16_t)atoi(optarg);
             if (opt_agent_port == 0) opt_agent_port = 8765;
             break;
+#endif
         default:		// Unknown option
             opt_error++;
             break;

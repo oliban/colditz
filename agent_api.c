@@ -46,7 +46,13 @@ static void send_response(int fd, int code, const char* ctype,
         "HTTP/1.0 %d %s\r\nContent-Type: %s\r\n"
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
         code, msg, ctype, len);
-    write(fd, hdr, n);
+    if (n >= (int)sizeof(hdr)) n = (int)sizeof(hdr) - 1;
+    size_t hdr_off = 0;
+    while (hdr_off < (size_t)n) {
+        ssize_t w = write(fd, hdr + hdr_off, n - hdr_off);
+        if (w <= 0) break;
+        hdr_off += (size_t)w;
+    }
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, (const char*)body + off, len - off);
