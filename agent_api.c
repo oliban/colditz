@@ -514,12 +514,11 @@ static void handle_room(int cfd)
          * detect the 0xFFFFFFFF CRM-gap sentinel BEFORE calling
          * set_room_xy() and touching the shared globals -- set_room_xy()
          * itself does not check this (see its comment at game.c:718-719). */
-        uint32_t chk_offset = CRM_ROOMS_START +
-            readlong((uint8_t*)fbuffer[ROOMS],
-                     CRM_OFFSETS_START + 4*(uint32_t)room);
-        if (chk_offset == 0xFFFFFFFF) {
+        uint32_t raw = readlong((uint8_t*)fbuffer[ROOMS],
+                                CRM_OFFSETS_START + 4*(uint32_t)room);
+        if (raw == 0xFFFFFFFF) {
             send_response(cfd, 500, "text/plain",
-                          "room data unavailable", 22);
+                          "room data unavailable", 21);
             return;
         }
     }
@@ -534,7 +533,7 @@ static void handle_room(int cfd)
     if (width == 0 || height == 0 ||
         (size_t)width * (size_t)height > ROOM_MAX_TILES) {
         room_x = saved_room_x; room_y = saved_room_y; offset = saved_offset;
-        send_response(cfd, 500, "text/plain", "room data unavailable", 22);
+        send_response(cfd, 500, "text/plain", "room data unavailable", 21);
         return;
     }
 
@@ -592,7 +591,7 @@ static void handle_room(int cfd)
      * should never actually trigger for real room/outside data -- it's a
      * defense-in-depth backstop, not the primary size guard. */
     if (n >= (int)sizeof(room_buf)) {
-        send_response(cfd, 500, "text/plain", "room data unavailable", 22);
+        send_response(cfd, 500, "text/plain", "room data unavailable", 21);
         return;
     }
 

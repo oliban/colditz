@@ -64,7 +64,9 @@ curl -s localhost:8765/room | python3 -m json.tool
   status, no key grade, no destination room. Duplicated with `E` cells in
   `grid` for convenience.
 - `my_tile`: the current prisoner's own position, as `[tile_x, tile_y]`
-  (`px/32`, `p2y/32`), always inside `[0,width) x [0,height)`.
+  (`px/32`, `p2y/32`), always inside `[0,width) x [0,height)`. During a
+  room-transition frame, my_tile may be clamped to the grid edge rather than
+  the true position.
 - Outside (`current_room_index == ROOM_OUTSIDE`), `width`/`height` are the
   fixed compressed-map dimensions (`CMP_MAP_WIDTH`=84, `CMP_MAP_HEIGHT`=72).
 - **Fair-play mandate (non-negotiable): `/room` exposes only what a human

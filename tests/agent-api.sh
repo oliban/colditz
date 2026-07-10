@@ -76,7 +76,7 @@ curl -s -X POST -d '{"pause":false}' http://127.0.0.1:$PORT/control >/dev/null
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"text":"hello from the agent"}' http://127.0.0.1:$PORT/say)
 [ "$CODE" = "200" ] && pass "/say accepted" || fail "/say returned $CODE"
 
-# 10. /room returns fair-play geometry
+# 9. /room returns fair-play geometry
 curl -s -o /tmp/room.json http://127.0.0.1:$PORT/room
 python3 - <<'EOF' && pass "/room geometry" || fail "/room geometry"
 import json
