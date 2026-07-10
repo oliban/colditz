@@ -11,6 +11,7 @@
 #include "agent_api.h"
 #include "colditz.h"   /* guybrush, p_event, game_state, props, game_time */
 #include "game.h"      /* guybrush[] extern */
+#include "conf.h"      /* KEY_* macros (resolve via loaded colditz.ini) */
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -173,7 +174,115 @@ static const char* prop_name[NB_PROPS] = {
 
 static const char* nation_name[NB_NATIONS] = { "british", "french", "american", "polish" };
 
-static int agent_input_queue_depth(void) { return 0; }  /* real in Task 4 */
+/* Non-static globals defined in main.c:145; glut_keyboard()/glut_keyboard_up()
+ * read/write these directly, and input_pump() below drives them the same
+ * way a real keypress/key-release would. */
+extern bool key_down[256], key_readonce[256];
+
+#define INPUT_QUEUE_LEN 32
+static struct { uint8_t code; int ticks; } input_q[INPUT_QUEUE_LEN];
+static int q_head = 0, q_len = 0;
+static int active_ticks = 0;          /* ticks left on current hold */
+
+static int agent_input_queue_depth(void) { return q_len + (active_ticks>0); }
+
+static uint8_t key_for_name(const char* name)
+{
+    if (!strcmp(name,"up"))        return KEY_DIRECTION_UP;
+    if (!strcmp(name,"down"))      return KEY_DIRECTION_DOWN;
+    if (!strcmp(name,"left"))      return KEY_DIRECTION_LEFT;
+    if (!strcmp(name,"right"))     return KEY_DIRECTION_RIGHT;
+    if (!strcmp(name,"action"))    return KEY_ACTION;
+    if (!strcmp(name,"pickup"))    return KEY_INVENTORY_PICKUP;
+    if (!strcmp(name,"drop"))      return KEY_INVENTORY_DROP;
+    if (!strcmp(name,"inv_left"))  return KEY_INVENTORY_LEFT;
+    if (!strcmp(name,"inv_right")) return KEY_INVENTORY_RIGHT;
+    if (!strcmp(name,"walk_run"))  return KEY_TOGGLE_WALK_RUN;
+    if (!strcmp(name,"sleep"))     return KEY_SLEEP;
+    if (!strcmp(name,"stooge"))    return KEY_STOOGE;
+    if (!strcmp(name,"pause"))     return KEY_PAUSE;
+    if (!strcmp(name,"escape"))    return KEY_ESCAPE;
+    if (!strcmp(name,"prisoner_1")) return KEY_PRISONER_BRITISH;
+    if (!strcmp(name,"prisoner_2")) return KEY_PRISONER_FRENCH;
+    if (!strcmp(name,"prisoner_3")) return KEY_PRISONER_AMERICAN;
+    if (!strcmp(name,"prisoner_4")) return KEY_PRISONER_POLISH;
+    return 0;
+}
+
+/* Minimal JSON string/int field extractors (fixed tiny schema, no lib). */
+static bool json_str(const char* body, const char* field, char* out, size_t sz)
+{
+    char pat[32]; const char* p; size_t i = 0;
+    snprintf(pat, sizeof(pat), "\"%s\"", field);
+    p = strstr(body, pat);
+    if (!p) return false;
+    p = strchr(p + strlen(pat), ':'); if (!p) return false;
+    p = strchr(p, '"');               if (!p) return false;
+    for (p++; *p && *p != '"' && i < sz-1; p++, i++) out[i] = *p;
+    out[i] = '\0';
+    return true;
+}
+static long json_int(const char* body, const char* field, long dflt)
+{
+    char pat[32]; const char* p;
+    snprintf(pat, sizeof(pat), "\"%s\"", field);
+    p = strstr(body, pat);
+    if (!p) return dflt;
+    p = strchr(p + strlen(pat), ':'); if (!p) return dflt;
+    return strtol(p+1, NULL, 10);
+}
+
+static void handle_input(int cfd, const char* body)
+{
+    char name[24]; char resp[64]; uint8_t code; long ms; int slot, n;
+    if (!body || !json_str(body, "key", name, sizeof(name))) {
+        send_response(cfd, 400, "text/plain", "missing \"key\"", 13);
+        return;
+    }
+    code = key_for_name(name);
+    if (code == 0) {
+        static const char* valid = "valid keys: up down left right action "
+            "pickup drop inv_left inv_right walk_run sleep stooge pause "
+            "escape prisoner_1..4";
+        send_response(cfd, 400, "text/plain", valid, strlen(valid));
+        return;
+    }
+    if (q_len >= INPUT_QUEUE_LEN) {
+        send_response(cfd, 400, "text/plain", "queue full", 10);
+        return;
+    }
+    ms = json_int(body, "ms", 100);
+    if (ms < 16) ms = 16;
+    if (ms > 10000) ms = 10000;
+    slot = (q_head + q_len) % INPUT_QUEUE_LEN;
+    input_q[slot].code = code;
+    input_q[slot].ticks = (int)(ms / 16);
+    if (input_q[slot].ticks < 1) input_q[slot].ticks = 1;
+    q_len++;
+    n = snprintf(resp, sizeof(resp), "{\"queued\":%d}",
+                 agent_input_queue_depth());
+    send_response(cfd, 202, "application/json", resp, n);
+}
+
+/* Called every tick from agent_api_tick(): advance the input machine. */
+static void input_pump(void)
+{
+    static uint8_t active_code = 0;
+    if (active_ticks > 0) {
+        if (--active_ticks == 0) {           /* release, like glut_keyboard_up */
+            key_down[active_code] = false;
+            key_readonce[active_code] = false;
+        }
+        return;                              /* one key at a time */
+    }
+    if (q_len > 0) {
+        active_code = input_q[q_head].code;
+        active_ticks = input_q[q_head].ticks;
+        q_head = (q_head + 1) % INPUT_QUEUE_LEN;
+        q_len--;
+        key_down[active_code] = true;        /* press, like glut_keyboard */
+    }
+}
 
 /* Status bar text, JSON-sanitized. Exported directly as `status_message`
  * (colditz.h:745: extern char *status_message;) -- no accessor needed. */
@@ -279,7 +388,11 @@ static void handle_request(int cfd)
         handle_state(cfd);
     else if (!strcmp(method, "GET") && !strcmp(path, "/screen"))
         handle_screen(cfd);
-    else
+    else if (!strcmp(method, "POST") && !strcmp(path, "/input")) {
+        char* hdr_end = strstr(req_buf, "\r\n\r\n");
+        char* body = hdr_end ? hdr_end + 4 : NULL;
+        handle_input(cfd, body);
+    } else
         send_response(cfd, 404, "text/plain", "not found", 9);
 }
 
@@ -287,6 +400,8 @@ void agent_api_tick(void)
 {
     struct timeval tv = { 0, 200000 };  // 200 ms cap per request
     int cfd;
+    input_pump();   /* first: held keys release on schedule even with no
+                     * client connected (and even if listen_fd is closed). */
     if (listen_fd < 0) return;
     cfd = accept(listen_fd, NULL, NULL);
     if (cfd < 0) return;
