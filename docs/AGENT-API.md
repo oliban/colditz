@@ -17,6 +17,7 @@ Design background: `docs/superpowers/specs/2026-07-10-agent-api-design.md`.
 | `/input` | POST | `{"key":"left","ms":400}` | 202 `{"queued":N}`, 400 on bad/missing key or full queue | Symbolic key + hold duration (ms, clamped 16–10000) resolved through the loaded key bindings, queued and injected via the same `key_down[]`/`key_readonce[]` path the real keyboard callback uses. Valid key names: `up down left right action pickup drop inv_left inv_right walk_run sleep stooge pause escape prisoner_1 prisoner_2 prisoner_3 prisoner_4`. |
 | `/control` | POST | `{"pause":true\|false}` | 200 `{"paused":bool}`, 400 if body missing `"pause"` or the input queue is full | Freeze/resume via the game's own `KEY_PAUSE` key path (see caveats below). Idempotent: if the game is already in the requested state, no key is injected and no toggle occurs. `{"speed":N}` slow-motion is designed in but not implemented in v1. |
 | `/say` | POST | `{"text":"..."}` | 200 `{"ok":true}`, 400 if `text` missing | Displays the given text on the in-game status bar (visible to spectators watching the game window), at a priority that overrides routine room/props messages. |
+| `/room` | GET | — | 200 JSON, or 500 `"room data unavailable"` if the room's data is unreadable | The **current** room's visible floor grid, exit tile coordinates, and the prisoner's own tile — for navigation. See fair-play note below; no room parameter is accepted (always serves the room the current prisoner is actually in). |
 
 Errors: malformed/missing JSON fields → 400 with a reason; unknown endpoint
 → 404; unknown key name → 400 listing valid names. Requests are capped at
@@ -33,7 +34,63 @@ never crash or block it permanently.
 curl -s localhost:8765/state | python3 -m json.tool
 curl -s localhost:8765/screen -o frame.png
 curl -s -X POST -d '{"key":"right","ms":500}' localhost:8765/input
+curl -s localhost:8765/room | python3 -m json.tool
 ```
+
+## `/room` — fair-play navigation geometry
+
+```json
+{
+  "room": 249,
+  "outside": false,
+  "width": 20, "height": 12,
+  "my_tile": [3, 7],
+  "grid": [
+    "....##E#....",
+    "....####....",
+    "..E#####...."
+  ],
+  "exits": [ {"tile": [6, 0]}, {"tile": [2, 2]} ]
+}
+```
+
+- `grid`: one string per row (`y=0` first), one character per tile:
+  `.` = void (tile id 0, no floor), `#` = floor (any nonzero tile id — a
+  coarse walkable test; furniture/walls within a nonzero tile can still
+  block movement at pixel level, this is a v1 approximation for corridor
+  navigation), `E` = exit cell (a doorway/stair — `readexit(x,y) & 0x1F`
+  is nonzero).
+- `exits`: tile coordinates only, one entry per exit cell — no locked/open
+  status, no key grade, no destination room. Duplicated with `E` cells in
+  `grid` for convenience.
+- `my_tile`: the current prisoner's own position, as `[tile_x, tile_y]`
+  (`px/32`, `p2y/32`), always inside `[0,width) x [0,height)`.
+- Outside (`current_room_index == ROOM_OUTSIDE`), `width`/`height` are the
+  fixed compressed-map dimensions (`CMP_MAP_WIDTH`=84, `CMP_MAP_HEIGHT`=72).
+- **Fair-play mandate (non-negotiable): `/room` exposes only what a human
+  player can see on screen.** It never reads or emits door locked/open
+  flags, key grades, props, or any other-room's data — an agent learns
+  whether a door is locked the same way a human does, by trying it (via
+  `/input`) and reading the resulting status message via `/state`. There is
+  also no room-index parameter: `/room` always serves whatever room the
+  current prisoner is actually standing in, both because the engine's
+  `readtile`/`readexit` macros are only self-consistent for the current
+  room (they key off `is_outside`, which tests `current_room_index`), and
+  because letting an agent peek into rooms it hasn't physically entered
+  would itself be a form of cheating.
+- Returns 500 `"room data unavailable"` instead of crashing if the room's
+  data can't be safely read: a CRM-file "gap" room (offset `0xFFFFFFFF`,
+  checked before touching any engine state) or implausible/garbage
+  dimensions (e.g. a tunnel room reading beyond `ROOM_MAX_TILES`, sized
+  well above the real 84x72 outside-map maximum).
+- Reads via a dedicated 32 KB static response buffer (the 8 KB `/state`
+  buffer is intentionally not reused — the outside grid alone is several
+  KB of characters before JSON overhead).
+- Saves and restores the engine's own `room_x`/`room_y`/`offset` globals
+  (used by `set_room_xy()`/`readtile`/`readexit` for the engine's own
+  mid-frame bookkeeping) around the read, on every return path, so serving
+  this request never disturbs other engine code that runs later in the
+  same frame or on the next callback.
 
 ## `/control` caveats
 

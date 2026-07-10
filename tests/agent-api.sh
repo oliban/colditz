@@ -76,6 +76,24 @@ curl -s -X POST -d '{"pause":false}' http://127.0.0.1:$PORT/control >/dev/null
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"text":"hello from the agent"}' http://127.0.0.1:$PORT/say)
 [ "$CODE" = "200" ] && pass "/say accepted" || fail "/say returned $CODE"
 
+# 10. /room returns fair-play geometry
+curl -s -o /tmp/room.json http://127.0.0.1:$PORT/room
+python3 - <<'EOF' && pass "/room geometry" || fail "/room geometry"
+import json
+r = json.load(open('/tmp/room.json'))
+assert isinstance(r['room'], int)
+assert isinstance(r['width'], int) and isinstance(r['height'], int)
+assert len(r['grid']) == r['height']
+assert all(len(row) == r['width'] for row in r['grid'])
+assert set(''.join(r['grid'])) <= set('.#E')
+tx, ty = r['my_tile']
+assert 0 <= tx < r['width'] and 0 <= ty < r['height']
+# fair play: no forbidden knowledge anywhere in the payload
+raw = open('/tmp/room.json').read()
+for word in ('locked','grade','open','prop','key'):
+    assert word not in raw, f"cheating field: {word}"
+EOF
+
 kill $PID 2>/dev/null
 # Belt-and-suspenders teardown, matched by name rather than trusting $PID:
 # colditz-test is launched inside a subshell ("cd ... && ./colditz-test ..."

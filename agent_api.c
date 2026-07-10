@@ -12,6 +12,7 @@
 #include "colditz.h"   /* guybrush, p_event, game_state, props, game_time */
 #include "game.h"      /* guybrush[] extern */
 #include "conf.h"      /* KEY_* macros (resolve via loaded colditz.ini) */
+#include "low-level.h" /* readlong/readword, used by readtile/readexit macros */
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -28,6 +29,14 @@
 
 bool agent_api_enabled = false;
 static int listen_fd = -1;
+
+/* room_x/room_y/offset are the engine's own working globals (defined in
+ * game.c, used by the readtile()/readexit() macros in game.h -- see
+ * set_room_xy(), game.c:707). game.h does not declare them extern itself;
+ * every other engine file that needs them (e.g. graphics.c:57-59) adds its
+ * own extern declaration, so we follow the same pattern here. */
+extern uint16_t room_x, room_y;
+extern uint32_t offset;
 
 /* Grow-on-demand buffer used by the stb PNG-encode write callback. Declared
  * once at file scope (rather than duplicated locally in png_append and
@@ -460,6 +469,136 @@ static void handle_state(int cfd)
     send_response(cfd, 200, "application/json", json, (size_t)n);
 }
 
+/* Largest room we will ever serve: the outside map is CMP_MAP_WIDTH(84) x
+ * CMP_MAP_HEIGHT(72) = 6048 tiles. This cap is checked against room_x*room_y
+ * right after set_room_xy() and rejects both that legitimate max (safely,
+ * with headroom) and any garbage width/height read out of a tunnel room
+ * (per the brief: tunnel rooms can read garbage through these macros). */
+#define ROOM_MAX_TILES 8192
+
+/* Dedicated 32 KB static response buffer -- the 8 KB /state buffer (`json`
+ * above) is too small: the outside grid alone is ~74 rows * ~88 chars
+ * (width + quotes/comma) =~ 6.5 KB, plus the exits array and other fields. */
+static char room_buf[32768];
+
+/* GET /room: the current room's *visible* geometry only -- walkable floor
+ * grid, exit tile coordinates, and the prisoner's own tile. Fair-play
+ * mandate (user-specified, non-negotiable): never expose anything a human
+ * player can't see on screen. In particular this never reads/emits door
+ * locked/open flags, key grades, props, or any other-room data -- an agent
+ * learns whether a door is locked the same way a human does, by trying it.
+ * We also only ever serve the CURRENT room: the readtile()/readexit()
+ * macros key off is_outside, which itself tests current_room_index, so
+ * serving an arbitrary room index would desync is_outside from the data
+ * actually being read (and would also let an agent see rooms it hasn't
+ * been in, which is its own flavor of cheating) -- so no room parameter
+ * is accepted. */
+static void handle_room(int cfd)
+{
+    uint16_t room = guybrush[current_nation].room;
+    bool outside = (room == ROOM_OUTSIDE);
+    /* CAUTION: room_x/room_y/offset are the engine's own working globals,
+     * reused elsewhere for the engine's own mid-frame bookkeeping. We save
+     * them before calling set_room_xy() and restore them before every
+     * return past that point, so this request never disturbs engine state
+     * the rest of the frame (or the next callback) depends on. */
+    uint16_t saved_room_x = room_x, saved_room_y = room_y;
+    uint32_t saved_offset = offset;
+    uint16_t width, height;
+    int16_t tile_x, tile_y;
+    int n = 0, x, y;
+    bool first;
+
+    if (!outside) {
+        /* Mirror set_room_xy()'s own offset computation (game.c:717) to
+         * detect the 0xFFFFFFFF CRM-gap sentinel BEFORE calling
+         * set_room_xy() and touching the shared globals -- set_room_xy()
+         * itself does not check this (see its comment at game.c:718-719). */
+        uint32_t chk_offset = CRM_ROOMS_START +
+            readlong((uint8_t*)fbuffer[ROOMS],
+                     CRM_OFFSETS_START + 4*(uint32_t)room);
+        if (chk_offset == 0xFFFFFFFF) {
+            send_response(cfd, 500, "text/plain",
+                          "room data unavailable", 22);
+            return;
+        }
+    }
+
+    set_room_xy(room);
+    width = room_x;
+    height = room_y;
+
+    /* Reject zero-sized or implausibly large dimensions (garbage read from
+     * a tunnel room, or any future corrupt data) before indexing anything,
+     * rather than trusting engine data blindly. */
+    if (width == 0 || height == 0 ||
+        (size_t)width * (size_t)height > ROOM_MAX_TILES) {
+        room_x = saved_room_x; room_y = saved_room_y; offset = saved_offset;
+        send_response(cfd, 500, "text/plain", "room data unavailable", 22);
+        return;
+    }
+
+    tile_x = guybrush[current_nation].px / 32;
+    tile_y = guybrush[current_nation].p2y / 32;
+    if (tile_x < 0) tile_x = 0;
+    if (tile_y < 0) tile_y = 0;
+    if (tile_x >= (int16_t)width)  tile_x = (int16_t)width  - 1;
+    if (tile_y >= (int16_t)height) tile_y = (int16_t)height - 1;
+
+    n = json_append(room_buf, sizeof(room_buf), n,
+        "{\"room\":%d,\"outside\":%s,\"width\":%d,\"height\":%d,"
+        "\"my_tile\":[%d,%d],\"grid\":[",
+        (int)room, outside?"true":"false", (int)width, (int)height,
+        (int)tile_x, (int)tile_y);
+
+    /* grid: one string per row (y=0 first). '.'=void (tile id 0), '#'=floor
+     * (any nonzero tile id -- a coarse walkable test; furniture/walls
+     * within a nonzero tile can still block at pixel level, documented in
+     * AGENT-API.md), 'E'=exit cell. We deliberately read ONLY the exit
+     * index's low 5 bits' nonzero-ness (readexit(x,y) & 0x1F) to know
+     * "this cell is a doorway/stair" -- never the locked/grade byte, which
+     * lives at a different offset entirely and is never touched here. */
+    for (y = 0; y < (int)height; y++) {
+        n = json_append(room_buf, sizeof(room_buf), n, "%s\"", y ? "," : "");
+        for (x = 0; x < (int)width; x++) {
+            char c = readtile(x, y) ? '#' : '.';
+            if ((readexit(x, y) & 0x1F) != 0)
+                c = 'E';
+            n = json_append(room_buf, sizeof(room_buf), n, "%c", c);
+        }
+        n = json_append(room_buf, sizeof(room_buf), n, "\"");
+    }
+    n = json_append(room_buf, sizeof(room_buf), n, "],\"exits\":[");
+
+    first = true;
+    for (y = 0; y < (int)height; y++) {
+        for (x = 0; x < (int)width; x++) {
+            if ((readexit(x, y) & 0x1F) != 0) {
+                n = json_append(room_buf, sizeof(room_buf), n,
+                    "%s{\"tile\":[%d,%d]}", first ? "" : ",", x, y);
+                first = false;
+            }
+        }
+    }
+    n = json_append(room_buf, sizeof(room_buf), n, "]}");
+
+    room_x = saved_room_x;
+    room_y = saved_room_y;
+    offset = saved_offset;
+
+    /* json_append() clamps rather than overflows, but a fully-clamped
+     * (truncated) buffer would be invalid/misleading JSON; refuse to send
+     * it rather than silently truncate. Given ROOM_MAX_TILES above this
+     * should never actually trigger for real room/outside data -- it's a
+     * defense-in-depth backstop, not the primary size guard. */
+    if (n >= (int)sizeof(room_buf)) {
+        send_response(cfd, 500, "text/plain", "room data unavailable", 22);
+        return;
+    }
+
+    send_response(cfd, 200, "application/json", room_buf, (size_t)n);
+}
+
 static void handle_request(int cfd)
 {
     static char req_buf[4096];
@@ -475,6 +614,8 @@ static void handle_request(int cfd)
         handle_state(cfd);
     else if (!strcmp(method, "GET") && !strcmp(path, "/screen"))
         handle_screen(cfd);
+    else if (!strcmp(method, "GET") && !strcmp(path, "/room"))
+        handle_room(cfd);
     else if (!strcmp(method, "POST") && !strcmp(path, "/input")) {
         char* hdr_end = strstr(req_buf, "\r\n\r\n");
         char* body = hdr_end ? hdr_end + 4 : NULL;
