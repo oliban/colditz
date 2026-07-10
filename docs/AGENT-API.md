@@ -18,6 +18,7 @@ Design background: `docs/superpowers/specs/2026-07-10-agent-api-design.md`.
 | `/control` | POST | `{"pause":true\|false}` | 200 `{"paused":bool}`, 400 if body missing `"pause"` or the input queue is full | Freeze/resume via the game's own `KEY_PAUSE` key path (see caveats below). Idempotent: if the game is already in the requested state, no key is injected and no toggle occurs. `{"speed":N}` slow-motion is designed in but not implemented in v1. |
 | `/say` | POST | `{"text":"..."}` | 200 `{"ok":true}`, 400 if `text` missing | Displays the given text on the in-game status bar (visible to spectators watching the game window), at a priority that overrides routine room/props messages. |
 | `/room` | GET | — | 200 JSON, or 500 `"room data unavailable"` if the room's data is unreadable | The **current** room's visible floor grid, exit tile coordinates, and the prisoner's own tile — for navigation. See fair-play note below; no room parameter is accepted (always serves the room the current prisoner is actually in). |
+| `/walk` | POST | `{"tile":[x,y]}` or `{"exit":N}` or `{"cancel":true}` | 202 `{"walking":true,"target":[x,y],"path_len":K}`; 200 `{"walking":false}` on cancel; 400 on bad/missing/out-of-bounds/void target; 409 `{"error":"no path"}` if unreachable, or `{"error":"input busy"}` if the `/input` queue isn't idle | Autonomous in-room pathing: BFS's a route over the same visible-floor-only geometry `/room` exposes, then drives it by holding the real direction keys (`key_down[KEY_DIRECTION_*]`), same as a held keypress. `{"exit":N}` walks to the Nth entry of `/room`'s own `exits` array. Ends `arrived` (target tile reached, or the room changed) or `blocked` (no pixel movement for ~0.65s — locked door, furniture, guard body-block). See fair-play note below. |
 
 Errors: malformed/missing JSON fields → 400 with a reason; unknown endpoint
 → 404; unknown key name → 400 listing valid names. Requests are capped at
@@ -35,6 +36,8 @@ curl -s localhost:8765/state | python3 -m json.tool
 curl -s localhost:8765/screen -o frame.png
 curl -s -X POST -d '{"key":"right","ms":500}' localhost:8765/input
 curl -s localhost:8765/room | python3 -m json.tool
+curl -s -X POST -d '{"exit":0}' localhost:8765/walk
+curl -s localhost:8765/state | python3 -c "import json,sys;print(json.load(sys.stdin)['walk'])"
 ```
 
 ## `/room` — fair-play navigation geometry
@@ -94,6 +97,71 @@ curl -s localhost:8765/room | python3 -m json.tool
   this request never disturbs other engine code that runs later in the
   same frame or on the next callback.
 
+## `/walk` — autonomous in-room pathing
+
+```bash
+curl -s -X POST -d '{"tile":[6,0]}' localhost:8765/walk
+# => {"walking":true,"target":[6,0],"path_len":9}
+curl -s -X POST -d '{"exit":0}' localhost:8765/walk       # walk to /room's exits[0]
+curl -s -X POST -d '{"cancel":true}' localhost:8765/walk  # => {"walking":false}
+```
+
+- Takes a target tile (`"tile":[x,y]`, in the current room's own coordinate
+  space) or an exit index (`"exit":N`, resolving to the Nth entry of
+  `/room`'s own `exits` array — a convenience so a caller doesn't have to
+  round-trip through `/room` just to get a coordinate it already has).
+  `"cancel":true` stops an in-progress walk immediately (keys released, 200
+  `{"walking":false}`); any other `"tile"`/`"exit"` body is ignored once
+  `"cancel"` is present.
+- Paths with a 4-connected BFS over a **snapshot** of the same visible-floor
+  grid `/room` exposes (any nonzero tile id, taken once when the walk is
+  accepted), then drives it exactly the way a held keypress would: holding
+  `key_down[KEY_DIRECTION_*]` toward each waypoint tile's center in turn
+  (two direction keys held together give the engine's own diagonal motion
+  for free). No malloc — the grid, BFS working arrays, and path are all
+  bounded static buffers sized for the largest room the engine ever serves
+  (the 84x72 outside map).
+- `path_len` in the 202 response is the number of waypoint tiles the BFS
+  found (informational only — no field of `/walk`'s response is meant for
+  precise dead-reckoning; poll `/state`'s `walk` field for progress).
+- **Fair-play (same mandate as `/room`, non-negotiable): the BFS treats
+  every nonzero tile — including exit/doorway cells — as walkable. It never
+  reads door locked/open flags, key grades, or anything else `/room`
+  doesn't already expose.** This means `/walk` can be accepted toward, and
+  legitimately end `blocked` at, a **locked door** — exactly how a human
+  player discovers a door is locked: by walking up to it and finding it
+  won't open. `/walk` is not a teleport or an oracle; it's a scripted hand
+  on the same keys a human has.
+- A waypoint (including the final target) is considered "reached" as soon
+  as the prisoner's tile (`px/32`, `p2y/32`) matches it — not necessarily
+  centered on it. For an **exit tile** specifically, this means `/walk`
+  reliably gets the prisoner to the doorway's threshold (`arrived`), but
+  actually crossing into the next room can need one more nudge (e.g. a
+  short follow-up `/input` hold in the same direction) — same as a human
+  player continuing to hold a direction key a beat longer while walking
+  through a door. `/state`'s `walk` field reports `arrived` the moment the
+  target tile is reached, whether or not the room has changed yet; a room
+  change at any point while walking (through this mechanism or any other)
+  also ends the walk as `arrived` immediately, superseding the target-tile
+  check.
+- Ends `blocked` if the prisoner's pixel position hasn't moved for 40
+  consecutive ticks (~0.65s at the ~16ms tick rate) while direction keys
+  are held — covers a locked door, blocking furniture, or a guard body
+  block, all indistinguishable from each other at this level (same as what
+  a human bumping into any of them experiences).
+- Ends `blocked` (not `arrived`) if the current prisoner changes mid-walk
+  (`prisoner_N` key, or any other cause) — the walk's whole premise (path
+  computed for a specific prisoner's position) no longer holds.
+- `/input` while walking cancels the walk first (keys released), then
+  queues the requested key — a manual key always overrides autonomous
+  walking. A `/walk` request while the `/input` queue is still busy (e.g.
+  a `/control` pause/unpause key still draining) is rejected with 409
+  `{"error":"input busy"}` rather than interleaving the two key-holding
+  mechanisms; poll `/state`'s `input_queue` field and retry once it's 0.
+- `/state` gains a `walk` field: `"idle"` (never walked, or cancelled),
+  `"walking"`, `"arrived"`, or `"blocked"` — the last-completed status
+  persists until the next `/walk` or a manual `/input` cancels it.
+
 ## `/control` caveats
 
 - **Pause goes through the real `KEY_PAUSE` binding (F5 by default), not a
@@ -118,13 +186,38 @@ curl -s localhost:8765/room | python3 -m json.tool
   asserts this directly and needed no adaptation.
 - Because the toggle is injected as a queued key (`enqueue_key`, same
   mechanism as `/input`) rather than applied synchronously, there is a
-  small delay (up to the key's `ms` hold, ~100 ms) between the `/control`
-  response and the game actually reaching the requested `paused` state.
+  small delay (up to the key's `ms` hold) between the `/control` response
+  and the game actually reaching the requested `paused` state.
   `/control`'s idempotence guard (`want != paused`) compares against the
   *current* `paused` flag at request time, so a burst of repeated identical
   calls issued faster than that delay could each see the old state and
   re-inject the toggle; callers polling `/state` before re-issuing
   `/control` avoid this.
+- **Unpausing holds the injected `KEY_PAUSE` for 2200 ms (pausing itself
+  only needs 100 ms).** These are not symmetric: pausing is consumed
+  immediately by `user_input()`'s `read_key_once(KEY_PAUSE)` on the very
+  next tick (`main.c:587`), so a short hold is plenty. Unpausing is only
+  detected once the pause screen's own fade state machine
+  (`glut_idle_static_pic`'s `PICTURE_WAIT` case) cycles back around to
+  polling for a key again — which takes ~2×`TRANSITION_DURATION` (2000 ms:
+  one fade-out, one fade-in, both defined at 1000 ms in `colditz.h`) to
+  reach from the moment pausing started, and it's the *only* place that
+  looks at `key_down[KEY_PAUSE]` again while paused (`user_input()`, and
+  every other key check, doesn't run at all while paused — see
+  `glut_idle_game`'s early return on `GAME_STATE_PAUSED`). A short
+  injected press releases well before that ~2 s mark if unpause is
+  requested soon after pause, so `PICTURE_WAIT` never catches it held and
+  the game is stranded paused forever (`paused` stays `true`, `game_time`
+  stays frozen indefinitely — reproduced and confirmed against the
+  pre-`/walk` build too, so this is a latent bug in the original
+  `/control`, not something the `/walk` feature introduced; fixed here
+  because `/walk`'s own test runs immediately after `/control`'s
+  pause/unpause test and depends on the game actually being unpaused and
+  responsive). One consequence: the `/input` queue can legitimately report
+  busy for up to ~2.2 s after an unpause request — callers issuing
+  `/input` or `/walk` right after unpausing should poll `/state`'s
+  `input_queue` field and wait for it to reach 0 first (as
+  `tests/agent-api.sh` now does before its `/walk` tests).
 - If the input queue is full, `/control` returns 400 rather than silently
   dropping the pause/unpause request (a deliberate deviation from the
   originally sketched implementation, which returned `void` from the

@@ -94,6 +94,32 @@ for word in ('locked','grade','open','prop','key'):
     assert word not in raw, f"cheating field: {word}"
 EOF
 
+# 10. /walk to first exit eventually changes room or reports blocked
+# Test 7's unpause needs a long injected KEY_PAUSE hold to bridge the pause
+# screen's ~2s fade-transition (see /control's handle_control comment) --
+# drain that before exercising /walk's own "input busy" precondition, same
+# as any other client would poll /state before issuing the next command.
+for i in $(seq 1 20); do
+  Q=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['input_queue'])")
+  [ "$Q" = "0" ] && break
+  sleep 0.2
+done
+EXIT_TILE=$(curl -s http://127.0.0.1:$PORT/room | python3 -c "import json,sys; r=json.load(sys.stdin); e=r['exits'][0]['tile']; print(f'{e[0]},{e[1]}')")
+ROOM0=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['prisoners'][0]['room'])")
+CODE=$(curl -s -o /tmp/walk.json -w '%{http_code}' -X POST -d "{\"tile\":[${EXIT_TILE%,*},${EXIT_TILE#*,}]}" http://127.0.0.1:$PORT/walk)
+[ "$CODE" = "202" ] && pass "/walk accepted" || fail "/walk returned $CODE"
+for i in $(seq 1 20); do
+  sleep 0.5
+  W=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['walk'])")
+  [ "$W" != "walking" ] && break
+done
+ROOM1=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['prisoners'][0]['room'])")
+if [ "$W" = "arrived" ] || [ "$ROOM1" != "$ROOM0" ]; then pass "/walk completed ($W, room $ROOM0 -> $ROOM1)"; else fail "/walk ended '$W' room unchanged"; fi
+
+# 11. /walk rejects garbage
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"tile":[999,999]}' http://127.0.0.1:$PORT/walk)
+[ "$CODE" = "400" ] && pass "/walk 400 on out-of-bounds" || fail "/walk oob returned $CODE"
+
 kill $PID 2>/dev/null
 # Belt-and-suspenders teardown, matched by name rather than trusting $PID:
 # colditz-test is launched inside a subshell ("cd ... && ./colditz-test ..."
