@@ -17,8 +17,8 @@ Design background: `docs/superpowers/specs/2026-07-10-agent-api-design.md`.
 | `/input` | POST | `{"key":"left","ms":400}` | 202 `{"queued":N}`, 400 on bad/missing key or full queue | Symbolic key + hold duration (ms, clamped 16–10000) resolved through the loaded key bindings, queued and injected via the same `key_down[]`/`key_readonce[]` path the real keyboard callback uses. Valid key names: `up down left right action pickup drop inv_left inv_right walk_run sleep stooge pause escape prisoner_1 prisoner_2 prisoner_3 prisoner_4`. |
 | `/control` | POST | `{"pause":true\|false}` | 200 `{"paused":bool}`, 400 if body missing `"pause"` or the input queue is full | Freeze/resume via the game's own `KEY_PAUSE` key path (see caveats below). Idempotent: if the game is already in the requested state, no key is injected and no toggle occurs. `{"speed":N}` slow-motion is designed in but not implemented in v1. |
 | `/say` | POST | `{"text":"..."}` | 200 `{"ok":true}`, 400 if `text` missing | Displays the given text on the in-game status bar (visible to spectators watching the game window), at a priority that overrides routine room/props messages. |
-| `/room` | GET | — | 200 JSON, or 500 `"room data unavailable"` if the room's data is unreadable | The **current** room's visible floor grid, exit tile coordinates, the prisoner's own tile, and the room's visible item props (name + tile) — for navigation. See fair-play note below; no room parameter is accepted (always serves the room the current prisoner is actually in). |
-| `/walk` | POST | `{"tile":[x,y]}` or `{"exit":N}` or `{"cancel":true}` | 202 `{"walking":true,"target":[x,y],"path_len":K}`; 200 `{"walking":false}` on cancel; 400 on bad/missing/out-of-bounds/void target; 409 `{"error":"no path"}` if unreachable, or `{"error":"input busy"}` if the `/input` queue isn't idle | Autonomous in-room pathing: BFS's a route over the same visible-floor-only geometry `/room` exposes, then drives it by holding the real direction keys (`key_down[KEY_DIRECTION_*]`), same as a held keypress. `{"exit":N}` walks to the Nth entry of `/room`'s own `exits` array. For an exit-tile target, reaching the doorway automatically continues through it (the CROSSING phase) — `arrived` means the room actually changed, not just that the threshold was reached. A stalled path gets one automatic sidestep-and-re-path recovery attempt before giving up. Ends `arrived` or `blocked` (no progress — locked door, furniture, guard body-block, or the 30s whole-walk cap). See fair-play note below. |
+| `/room` | GET | — | 200 JSON, or 500 `"room data unavailable"` if the room's data is unreadable | The **current** room's visible floor grid, exit tile coordinates, the prisoner's own tile, and the room's visible item props (name, tile, and pixel anchor `x`/`y`) — for navigation. See fair-play note below; no room parameter is accepted (always serves the room the current prisoner is actually in). |
+| `/walk` | POST | `{"tile":[x,y]}` or `{"exit":N}` or `{"item":"<name>","pickup":bool}` or `{"cancel":true}` | 202 `{"walking":true,"target":[x,y],"path_len":K}` (item mode also echoes `"item":"<name>"`); 200 `{"walking":false}` on cancel; 400 on bad/missing/out-of-bounds/void target or unknown/absent item name; 409 `{"error":"no path"}` if unreachable, or `{"error":"input busy"}` if the `/input` queue isn't idle | Autonomous in-room pathing: BFS's a route over the same visible-floor-only geometry `/room` exposes, then drives it by holding the real direction keys (`key_down[KEY_DIRECTION_*]`), same as a held keypress. `{"exit":N}` walks to the Nth entry of `/room`'s own `exits` array. `{"item":"<name>"}` looks the name up among the current room's visible props (same names `/room`'s `items` list uses) and walks to it at pixel precision; add `"pickup":true` to tap the pickup key on arrival. For an exit-tile target, reaching the doorway automatically continues through it (the CROSSING phase) — `arrived` means the room actually changed, not just that the threshold was reached. A stalled path gets one automatic sidestep-and-re-path recovery attempt before giving up (item walks get a dedicated corner-rounding recovery instead, see below). Ends `arrived` or `blocked` (no progress — locked door, furniture, guard body-block, or the 30s whole-walk cap). See fair-play note below. |
 
 Errors: malformed/missing JSON fields → 400 with a reason; unknown endpoint
 → 404; unknown key name → 400 listing valid names. Requests are capped at
@@ -54,7 +54,7 @@ curl -s localhost:8765/state | python3 -c "import json,sys;print(json.load(sys.s
     "..E#####...."
   ],
   "exits": [ {"tile": [6, 0]}, {"tile": [2, 2]} ],
-  "items": [ {"name": "lockpick", "tile": [4, 3]} ]
+  "items": [ {"name": "lockpick", "tile": [4, 3], "x": 137, "y": 108} ]
 }
 ```
 
@@ -69,14 +69,23 @@ curl -s localhost:8765/state | python3 -c "import json,sys;print(json.load(sys.s
   `grid` for convenience.
 - `items`: the CURRENT room's pickable props (Task 9) — one entry per prop
   actually present (already-picked-up props are omitted), each `{"name":
-  "<prop name>", "tile":[x,y]}`. `name` is the same string `/state`'s
-  per-prisoner `inventory` keys use (the shared `prop_name[]` table, e.g.
-  `"lockpick"`, `"key_one"`, `"pass"`); `tile` is the prop's position
-  converted to tile coordinates the same way `my_tile` is. This is exactly
-  the data `set_room_props()`/`set_props_overlays()` draw on screen every
-  frame, read the same way (including skipping a prop hidden behind a
-  removable outside wall) — nothing about a prop's lock/hidden state
-  (there isn't any) or any other room's props is exposed.
+  "<prop name>", "tile":[x,y], "x":anchor_x, "y":anchor_y}`. `name` is the
+  same string `/state`'s per-prisoner `inventory` keys use (the shared
+  `prop_name[]` table, e.g. `"lockpick"`, `"key_one"`, `"pass"`); `tile` is
+  the prop's position converted to tile coordinates the same way `my_tile`
+  is. `x`/`y` (added for the `/walk` item-pickup feature) are the prop's
+  exact pickup-trigger pixel anchor in the same room-pixel coordinate space
+  as `/state`'s per-prisoner `x`/`y` (`x = raw_x - 15`, `y = raw_y - 4`,
+  read from the same object-table words the engine's own
+  `check_footprint()` over-prop test uses, game.c:962-994) — the engine
+  triggers pickup when `prisoner_x` is in `[x-9, x+8)` and `prisoner_2y/2`
+  is in `[y-9, y+8)`, so a caller can walk to pixel precision instead of
+  only tile precision (a prop can sit off a tile's center by
+  furniture-sized margins). This is exactly the data
+  `set_room_props()`/`set_props_overlays()` draw on screen every frame,
+  read the same way (including skipping a prop hidden behind a removable
+  outside wall) — nothing about a prop's lock/hidden state (there isn't
+  any) or any other room's props is exposed.
 - `my_tile`: the current prisoner's own position, as `[tile_x, tile_y]`
   (`px/32`, `p2y/32`), always inside `[0,width) x [0,height)`. During a
   room-transition frame, my_tile may be clamped to the grid edge rather than
@@ -205,6 +214,60 @@ curl -s -X POST -d '{"cancel":true}' localhost:8765/walk  # => {"walking":false}
 - `/state` gains a `walk` field: `"idle"` (never walked, or cancelled),
   `"walking"`, `"arrived"`, or `"blocked"` — the last-completed status
   persists until the next `/walk` or a manual `/input` cancels it.
+
+### `/walk` item mode — pixel-precision pickup
+
+```bash
+curl -s -X POST -d '{"item":"lockpick","pickup":true}' localhost:8765/walk
+# => {"walking":true,"target":[4,3],"path_len":6,"item":"lockpick"}
+```
+
+- `"item":"<name>"` looks the name up among the CURRENT room's visible props
+  (the same `prop_name[]` table and scan `/room`'s `items` list uses — see
+  `find_room_item()` in `agent_api.c`); 400 `"no such item here"` if the
+  name is unknown or not present in this room right now. Add
+  `"pickup":true` to have `/walk` tap `KEY_INVENTORY_PICKUP` (the same key
+  `/input {"key":"pickup"}` uses) the instant it arrives — omit it (or set
+  `false`) to just walk there without picking anything up.
+- BFS targets the prop's own tile; if that tile itself isn't walkable
+  (furniture/void underneath the prop), it falls back to the nearest
+  walkable 4-neighbor tile instead (409 `{"error":"no path"}` if none of
+  the four neighbors are walkable either). An item walk is never treated as
+  an exit crossing, even if the resolved tile happens to also be a doorway
+  cell.
+- Reaching that tile does **not** immediately end the walk (tile precision
+  is too coarse — the engine's real pickup trigger is the pixel-precision
+  window described in `/room`'s `items.x`/`y` above, and can sit off a
+  tile's center by furniture-sized margins). Instead it hands off to a
+  dedicated **ITEM_PIXEL** phase that steers one axis at a time (x first,
+  then y — never both at once the way plain tile-following does) until
+  both are within ±6px of the prop's anchor, matching the engine's own
+  17px-wide pickup window with margin to spare. `arrived` for an item walk
+  therefore always means the engine's pickup test would also pass.
+- **Corner-rounding stall recovery.** If the prisoner sits pinned against
+  an obstacle — the field case that motivated this: a prop tucked against
+  a bed, where pushing straight on the blocked axis makes zero progress
+  while the free path is around the bed's corner — a stall on the
+  ITEM_PIXEL phase triggers a bounded shift-then-push zigzag: hold only a
+  perpendicular "explore" direction briefly to clear the obstruction, then
+  hold only the still-blocked primary direction to push into the
+  now-open gap, repeating (and re-picking primary/perpendicular fresh each
+  cycle from wherever that leaves the prisoner) until arrival, until a full
+  cycle produces no net movement on either axis (flips to the other
+  perpendicular side), or until the recovery's own bounded time budget
+  (~12.8s) runs out. This is a dedicated maneuver, not a reuse of the
+  plain-tile-following sidestep recovery above — a single-axis-only nudge
+  was verified live to just slide back and forth without ever making
+  progress on the corner case; a simultaneous two-key diagonal hold was
+  also tried and verified live to be rejected by this engine's collision
+  test even when the sequential shift-then-push is accepted. One recovery
+  attempt per walk (the same `walk_recovered` latch every other phase
+  shares); a further stall after that is `blocked`.
+- All the ordinary `/walk` termination rules still apply unchanged: prisoner
+  switch or room change mid-walk ends it, the whole-walk 30s cap still
+  applies across pathing + recovery + pixel-steering combined, `/input`
+  still cancels an in-progress item walk, and `/walk {"cancel":true}` still
+  stops it immediately (keys released) at any phase.
 
 ## `/control` caveats
 

@@ -65,7 +65,7 @@ void agent_api_init(uint16_t port)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(listen_fd, 4) < 0)
+        listen(listen_fd, 16) < 0)
     {
         perror("agent_api: bind/listen (API disabled)");
         close(listen_fd);
@@ -690,7 +690,7 @@ static void handle_room(int cfd)
         uint16_t prop_offset = room_props[u];
         uint8_t item_id;
         uint16_t raw_x, raw_y;
-        int16_t itile_x, itile_y;
+        int16_t itile_x, itile_y, anchor_x, anchor_y;
 
         if (prop_offset == 0)
             continue;   /* picked up since the last set_room_props() call */
@@ -704,9 +704,18 @@ static void handle_room(int cfd)
          * coordinates the same way my_tile is (divide by the tile pixel
          * size on each axis -- 32 for x, 16 for y since these words store
          * a py-equivalent, not p2y, value: main.c's drop handler writes
-         * prisoner_2y/2+4 here, matching prop_offset+2's read-back). */
+         * prisoner_2y/2+4 here, matching prop_offset+2's read-back). This
+         * is also the EXACT engine pickup-trigger anchor (game.c:962-994,
+         * check_footprint's over_prop test): prisoner_x in [x-9,x+8) and
+         * prisoner_2y/2 in [y-9,y+8), the same room-pixel-coordinate space
+         * /state's per-prisoner x/y fields use -- exposed below as `x`/`y`
+         * so a caller can walk to pixel precision instead of only tile
+         * precision (which is too coarse: a prop can sit off a tile's
+         * center by furniture-sized margins). */
         raw_x = readword(fbuffer[OBJECTS], prop_offset + 4);
         raw_y = readword(fbuffer[OBJECTS], prop_offset + 2);
+        anchor_x = (int16_t)(raw_x - 15);
+        anchor_y = (int16_t)(raw_y - 4);
         itile_x = (int16_t)((raw_x - 15) / 32);
         itile_y = (int16_t)((raw_y - 4) / 16);
 
@@ -728,8 +737,9 @@ static void handle_room(int cfd)
         if (itile_y >= (int16_t)height) itile_y = (int16_t)height - 1;
 
         n = json_append(room_buf, sizeof(room_buf), n,
-            "%s{\"name\":\"%s\",\"tile\":[%d,%d]}", first ? "" : ",",
-            prop_name[item_id], (int)itile_x, (int)itile_y);
+            "%s{\"name\":\"%s\",\"tile\":[%d,%d],\"x\":%d,\"y\":%d}",
+            first ? "" : ",", prop_name[item_id],
+            (int)itile_x, (int)itile_y, (int)anchor_x, (int)anchor_y);
         first = false;
     }
     n = json_append(room_buf, sizeof(room_buf), n, "]}");
@@ -822,6 +832,108 @@ static int16_t walk_start_x = 0, walk_start_y = 0;
  * immediately as arrived (plain-tile walks, unchanged Task 8 behavior). */
 static bool walk_is_exit_target = false;
 
+/* True for an item-mode walk ({"item":"<name>"}, the pickup feature) --
+ * gates whether reaching the BFS target tile hands off to the pixel-
+ * precision ITEM_PIXEL phase instead of ending the walk immediately.
+ * Mutually exclusive with walk_is_exit_target (handle_walk always forces
+ * the exit-target test off for an item walk -- reaching a prop's tile is
+ * never a doorway crossing). walk_item_anchor_x/y are the prop's exact
+ * pickup-trigger pixel anchor (same room-pixel-coordinate space as /state's
+ * x/y, computed once at accept time via the game.c:962-994 formula -- see
+ * handle_room's `items` block for the identical computation). */
+static bool walk_is_item_target = false;
+static bool walk_item_pickup = false;
+static int16_t walk_item_anchor_x = 0, walk_item_anchor_y = 0;
+
+/* ITEM_PIXEL phase's per-axis progress tracker (ordinary, non-rounding
+ * steering): tracks the best (smallest) distance-to-target seen on
+ * whichever axis is currently "primary" (the one being actively steered,
+ * x taking priority over y -- see walk_pump_item_pixel), and how many
+ * ticks it's been since that best was improved. Reset whenever the
+ * primary axis switches (x settling into its deadband and handing off to
+ * y, or vice versa) so a fresh window always applies to whichever axis is
+ * currently being pushed. Hitting WALK_ITEM_PROGRESS_TICKS with no
+ * improvement is the furniture-corner-stall trigger for a corner-rounding
+ * round (see walk_pump_item_round below) -- deliberately far more
+ * sensitive than the whole-walk WALK_STALL_LIMIT every other phase uses:
+ * a pinned prisoner can keep sliding along a blocked axis (technically
+ * moving a little most ticks, from collision-response jitter) while never
+ * actually getting closer, so literal zero-movement detection misses the
+ * stall entirely -- exactly what let the walker sit pinned against a bed
+ * for 13+ frames in the film that motivated this feature. */
+static bool walk_item_progress_axis_is_x = false;
+static int16_t walk_item_progress_best = 0;
+static int walk_item_progress_ticks = 0;
+#define WALK_ITEM_PROGRESS_TICKS 10   /* ~0.16s -- brief, verbatim ("~10 ticks") */
+
+/* Corner-rounding: a bounded sequence of explicit sidestep-then-re-attempt
+ * rounds (brief, verbatim: "sidestep PERPENDICULAR ~12px one side; if
+ * still no progress after re-attempt, ~24px the other side; re-attempt.
+ * Max 3 corner-rounding rounds"), NOT a fixed-tick-count shift/push zigzag
+ * with an exact-position-equality "did that help?" test -- an earlier
+ * version of this phase worked that way and was verified live (room 251's
+ * lockpick against a bunk bed) to get stuck retrying the wrong side
+ * forever: a blocked push still causes a little collision-response
+ * jitter most cycles, so exact-equality almost never true, so the side
+ * never flipped away from the wrong one. This version MEASURES actual
+ * pixel displacement for the sidestep step, and judges the re-attempt
+ * step by the same best-distance progress test ordinary steering uses
+ * (above), so both stages decide "did that help?" the same principled
+ * way. Each round: (1) hold ONLY a perpendicular direction until measured
+ * perpendicular displacement reaches that round's target pixel count (or
+ * a safety tick cap, in case the perpendicular direction is ALSO
+ * blocked), (2) hold ONLY the still-blocked primary direction and watch
+ * for progress. Progress -> round succeeds, drop back to ordinary
+ * steering with a fresh progress window (the whole-walk round budget is
+ * NOT reset, so a later stall picks up where this one left off). No
+ * progress -> next round: bigger sidestep, alternating sides (round 1:
+ * 12px side A; round 2: 24px side B; round 3: 24px side A again, in case
+ * A was the right side but round 1's 12px undershot the corner).
+ * Exhausting WALK_ITEM_ROUND_MAX rounds falls through to the SAME
+ * generic sidestep-then-re-BFS recovery plain-tile PATH-phase stalls use
+ * (walk_recovered, shared, one shot per whole walk) -- brief, verbatim:
+ * "then the existing one-shot re-path recovery -> then blocked". The
+ * primary axis for a whole round is captured once at the round's start
+ * (walk_item_round_primary_is_x) rather than recomputed every tick, so a
+ * momentary axis flip mid-round (brief: "temporary leaving of an in-range
+ * axis during rounding is allowed") doesn't reinterpret which direction
+ * is being sidestepped partway through. */
+#define WALK_ITEM_ROUND_MAX 3   /* per approach side; matches the brief's 3-round design */
+#define WALK_ITEM_ROUND_REATTEMPT_TICKS 10
+#define WALK_ITEM_ROUND_SIDESTEP_CAP_TICKS 80   /* ~1.28s safety cap if the perpendicular direction is itself blocked */
+static const int16_t walk_item_round_target_px[WALK_ITEM_ROUND_MAX] = { 12, 24, 24 };
+static int walk_item_round = 0;                    /* rounds started so far this walk (whole-walk budget) */
+static bool walk_item_rounding = false;             /* currently executing a round */
+static bool walk_item_round_sidestepping = false;   /* true: sidestep sub-step; false: re-attempt sub-step */
+static bool walk_item_round_primary_is_x = false;   /* primary axis, frozen for the round's duration */
+static int walk_item_round_side = 0;                /* which perpendicular side this round tries */
+static int16_t walk_item_round_ref_px = 0, walk_item_round_ref_p2y = 0;  /* position when the current sub-step began */
+static int walk_item_round_ticks = 0;               /* ticks elapsed in the current sub-step */
+static int16_t walk_item_round_best_dist = 0;       /* primary-axis distance when the re-attempt sub-step began */
+
+/* Deadband (+-px) around the item anchor: ordinary steering stops
+ * actively correcting an axis once it's this close, handing primary
+ * steering off to the other axis. Looser +-WALK_ITEM_MARGIN is used only
+ * for the arrival test, so an axis that's stopped being corrected is
+ * already guaranteed to satisfy arrival too. The engine's own
+ * pickup-trigger window (game.c:962-994) is prisoner_x-anchor_x in
+ * [-9,+8) and prisoner_2y/2-anchor_y in [-9,+8) -- a 17-wide window;
+ * +-7 sits strictly inside it on both sides, so "arrived" here always
+ * implies the engine's own pickup test also passes. */
+#define WALK_ITEM_DEADBAND 6
+#define WALK_ITEM_MARGIN 7
+
+/* Approach-side cycling for item walks: the prop's own tile is often
+ * tile-walkable while furniture pixel-blocks the pickup window from some
+ * sides (live case: room 251's lockpick is unreachable from the bed's
+ * south face but reachable from the east). When corner-rounding exhausts
+ * on one approach, re-BFS to the next untried walkable 4-neighbor of the
+ * prop tile and re-run the pixel approach from there; only when every
+ * side has been tried does the walk fall through to the generic recovery
+ * and then blocked. */
+static int16_t walk_item_prop_tx = -1, walk_item_prop_ty = -1;
+static uint8_t walk_item_tried_mask = 0;   /* bit i = neighbor (E,W,S,N)[i] attempted */
+
 /* Snapshot of "who/where" taken at walk start, so the pump can detect a
  * prisoner switch or room change without re-reading engine globals it
  * doesn't otherwise need. */
@@ -862,8 +974,22 @@ static int walk_stall_ticks = 0;
  * All three phases terminate exclusively through walk_cancel() (called
  * from walk_pump's shared per-tick preamble below), so the single
  * key-release choke point from Task 8 still holds for every new
- * termination path this adds. */
-typedef enum { WALK_PHASE_PATH, WALK_PHASE_CROSS, WALK_PHASE_SIDESTEP } walk_phase_t;
+ * termination path this adds.
+ *
+ * A fourth phase, WALK_PHASE_ITEM_PIXEL (the /walk item+pickup feature),
+ * follows the same rule: entered when a PATH-phase item walk reaches its
+ * target tile, it steers to pixel precision and terminates exclusively
+ * through walk_cancel() too. Its own stall recovery is a dedicated bounded
+ * corner-rounding sequence (see walk_pump_item_round's header comment);
+ * only once THAT is exhausted does it fall through to WALK_PHASE_SIDESTEP
+ * itself, reusing the exact same one-shot walk_recovered-gated
+ * sidestep-then-re-BFS plain-tile stalls use -- on that path's re-BFS
+ * completing, PATH-phase's own target-reached check routes back into
+ * ITEM_PIXEL. */
+typedef enum {
+    WALK_PHASE_PATH, WALK_PHASE_CROSS, WALK_PHASE_SIDESTEP,
+    WALK_PHASE_ITEM_PIXEL
+} walk_phase_t;
 static walk_phase_t walk_phase = WALK_PHASE_PATH;
 
 /* One recovery attempt per walk (part B); reset in handle_walk. */
@@ -890,9 +1016,22 @@ static int walk_cross_round = 0;
 static int walk_cross_ticks = 0;
 
 /* SIDESTEP (recovery) phase state: try one perpendicular side, then the
- * other, each for a bounded time, before re-pathing. */
+ * other, each for a bounded time, then -- since the engine rejects a
+ * blocked diagonal (both axes held at once, as PATH-phase's ordinary
+ * steering does) as a single atomic move even when either axis ALONE is
+ * free (verified live: room 251's post-pickup corner lets a single held
+ * "right" cross a full tile boundary, and a single held "down" then clears
+ * the furniture entirely, while holding both together never moves the
+ * prisoner at all) -- a third leg retries the ORIGINAL blocked primary
+ * direction alone (single-axis, matching the perpendicular legs' own
+ * single-key discipline) before giving up and re-pathing. This mirrors the
+ * item-pixel phase's own sidestep-then-reattempt design (see
+ * walk_item_start_round's header comment) for the same reason: a
+ * furniture corner needs single-axis probing to round, not a simultaneous
+ * two-axis push. */
 #define WALK_SIDESTEP_LEG_TICKS 25   /* ~0.4s per side */
 static walk_dir_t walk_sidestep_dir[2];
+static walk_dir_t walk_sidestep_primary_dir;
 static int walk_sidestep_idx = 0;
 static int walk_sidestep_ticks = 0;
 
@@ -1241,28 +1380,17 @@ static void walk_pump_cross(void)
     }
 }
 
-/* SIDESTEP (recovery, part B) phase: hold one perpendicular side, then
- * the other, each for WALK_SIDESTEP_LEG_TICKS ticks; once both are tried,
- * release and re-BFS from wherever that left the prisoner to the walk's
- * ORIGINAL target (walk_target_x/y, not whatever waypoint we'd been
- * chasing) on a FRESH grid snapshot, then resume WALK_PHASE_PATH. Blocked
- * if the fresh snapshot or the re-BFS fails (e.g. the sidestep itself ran
- * into a wall and made no progress). */
-static void walk_pump_sidestep(void)
+/* Shared tail of SIDESTEP recovery (also used by walk_pump_sidestep's
+ * early-success path below): release keys, take a fresh grid snapshot,
+ * re-BFS from wherever the prisoner now is to the walk's ORIGINAL target
+ * (walk_target_x/y, not whatever waypoint we'd been chasing), and resume
+ * WALK_PHASE_PATH. Blocked if the fresh snapshot or the re-BFS fails (e.g.
+ * the sidestep itself ran into a wall and made no progress). */
+static void walk_sidestep_finish(void)
 {
     uint16_t width = 0, height = 0;
     int16_t sx, sy;
     int new_len = 0, snap;
-
-    if (++walk_sidestep_ticks < WALK_SIDESTEP_LEG_TICKS)
-        return;
-
-    walk_sidestep_idx++;
-    if (walk_sidestep_idx < 2) {
-        walk_sidestep_ticks = 0;
-        walk_hold_only(walk_dir_key(walk_sidestep_dir[walk_sidestep_idx]));
-        return;
-    }
 
     walk_release_keys();
     snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
@@ -1290,6 +1418,330 @@ static void walk_pump_sidestep(void)
     walk_stall_px = guybrush[current_nation].px;
     walk_stall_p2y = guybrush[current_nation].p2y;
     walk_phase = WALK_PHASE_PATH;
+}
+
+/* Minimum combined pixel displacement (from the position where the stall
+ * -- and so this whole recovery -- began) that counts as genuine escape
+ * rather than collision-response jitter (observed jitter tops out around
+ * 4px even on a fully blocked axis; a real single-axis move covers well
+ * over 10px in one WALK_SIDESTEP_LEG_TICKS leg). */
+#define WALK_SIDESTEP_ESCAPE_PX 10
+
+/* SIDESTEP (recovery, part B) phase: hold one perpendicular side, then
+ * retry the ORIGINAL blocked primary direction alone, then the OTHER
+ * perpendicular side, then retry primary again -- each for
+ * WALK_SIDESTEP_LEG_TICKS ticks. A primary-direction retry that actually
+ * moves the prisoner a real distance (not just jitter) ends recovery
+ * immediately via walk_sidestep_finish(); this is deliberately checked
+ * after EACH perpendicular leg rather than only once at the end, because
+ * the two perpendicular legs go opposite ways and so, left to run both
+ * before ever trying primary, would cancel each other back out to
+ * approximately the starting position -- exactly what a straight PATH-phase
+ * stall trying to squeeze past a furniture corner needs: PATH-phase's
+ * ordinary steering holds both axes at once, which the engine rejects as a
+ * single atomic move if EITHER axis would collide, even when each axis
+ * individually is free (verified live: room 251's post-item-pickup corner
+ * lets a single held direction cross a full tile boundary and then a
+ * single held perpendicular direction clear the furniture entirely, while
+ * holding both together never moves the prisoner at all). Once all four
+ * legs are exhausted with no real progress, falls through to
+ * walk_sidestep_finish() exactly as the two-leg version did. */
+static void walk_pump_sidestep(void)
+{
+    int16_t px, p2y, dpx, dp2y;
+
+    if (++walk_sidestep_ticks < WALK_SIDESTEP_LEG_TICKS)
+        return;
+
+    px = guybrush[current_nation].px;
+    p2y = guybrush[current_nation].p2y;
+
+    if (walk_sidestep_idx == 1 || walk_sidestep_idx == 3) {
+        dpx  = (int16_t)(px  - walk_stall_px);
+        dp2y = (int16_t)((p2y - walk_stall_p2y) / 2);
+        if ((dpx < 0 ? -dpx : dpx) + (dp2y < 0 ? -dp2y : dp2y) >= WALK_SIDESTEP_ESCAPE_PX) {
+            walk_sidestep_finish();
+            return;
+        }
+    }
+
+    walk_sidestep_idx++;
+    if (walk_sidestep_idx < 4) {
+        walk_sidestep_ticks = 0;
+        /* Legs 0,2: perpendicular probe. Legs 1,3: retry the original
+         * blocked primary direction alone. */
+        if (walk_sidestep_idx == 2)
+            walk_hold_only(walk_dir_key(walk_sidestep_dir[1]));
+        else
+            walk_hold_only(walk_dir_key(walk_sidestep_primary_dir));
+        return;
+    }
+
+    walk_sidestep_finish();
+}
+
+/* ITEM_PIXEL phase (the /walk item+pickup feature): entered once the BFS
+ * path for an item walk reaches the prop's tile (or its nearest walkable
+ * neighbor, see handle_walk). The BFS/PATH machinery only gets the
+ * prisoner to a *tile*; the engine's actual pickup trigger is a pixel-
+ * precision window around the prop's exact anchor (walk_item_anchor_x/y,
+ * see its own comment above) that can sit off-center within that tile, or
+ * be partly obstructed by furniture at pixel level -- tile precision alone
+ * is not enough, hence this dedicated phase.
+ *
+ * Per-axis independent steering (brief, verbatim): a straight-line
+ * (both-axes-at-once) approach, like PATH-phase's diagonal steering, can
+ * stall forever against a furniture corner that a single-axis approach
+ * would walk around. So this phase steers ONE axis at a time -- x first
+ * (holding only a left/right key, y keys released) until x settles within
+ * +-WALK_ITEM_DEADBAND of the anchor, THEN y (holding only up/down, x
+ * keys released) -- rather than holding all four/two keys toward the
+ * anchor's exact center the way PATH-phase does. "Arrived" requires BOTH
+ * axes within the looser +-WALK_ITEM_MARGIN at once, matching the engine's
+ * pickup window.
+ *
+ * See the walk_item_round* state block above for the corner-rounding
+ * stall-recovery design (a bounded, MEASURED sidestep-then-reattempt
+ * sequence) and why it replaced an earlier tick-count/exact-equality
+ * zigzag that got stuck retrying the wrong side forever. */
+static void walk_pump_item_round(int16_t px, int16_t p2y,
+                                  int16_t dx, int16_t dy,
+                                  int16_t adx, int16_t ady);
+
+static void walk_item_start_round(int16_t px, int16_t p2y, bool primary_is_x)
+{
+    /* First sidestep goes TOWARD the anchor's perpendicular offset (the
+     * free path around an obstacle's corner is almost always on the side
+     * the target is on); later rounds alternate away from it. Side 0 =
+     * positive direction (down/right), side 1 = negative (up/left). */
+    int16_t perp_delta = primary_is_x ? (int16_t)(p2y/2 - walk_item_anchor_y)
+                                      : (int16_t)(px - walk_item_anchor_x);
+    int toward = (perp_delta < 0) ? 0 : 1;   /* anchor below/right of us -> side 0 */
+    walk_item_rounding = true;
+    walk_item_round_sidestepping = true;
+    walk_item_round_side = ((walk_item_round & 1) == 0) ? toward : (1 - toward);
+    walk_item_round_primary_is_x = primary_is_x;
+    walk_item_round_ref_px = px;
+    walk_item_round_ref_p2y = p2y;
+    walk_item_round_ticks = 0;
+    walk_item_round++;
+}
+
+/* Approach-side cycling (see walk_item_prop_tx block above): pick the next
+ * untried walkable 4-neighbor of the prop tile, BFS to it, and resume the
+ * PATH phase (arrival there re-enters ITEM_PIXEL as usual since
+ * walk_is_item_target stays set). Returns false when no untried side
+ * remains or nothing is reachable. */
+static bool walk_item_try_next_side(void)
+{
+    static const int8_t adx[4] = { 1, -1, 0, 0 };   /* E, W, S, N */
+    static const int8_t ady[4] = { 0, 0, 1, -1 };
+    uint16_t width = 0, height = 0;
+    int16_t sx, sy;
+    int i, new_len = 0;
+
+    if (walk_item_prop_tx < 0 ||
+        walk_snapshot_grid(&width, &height, -1, NULL, NULL) != WALK_SNAP_OK)
+        return false;
+    walk_width = width;
+    walk_height = height;
+    sx = guybrush[current_nation].px / 32;
+    sy = guybrush[current_nation].p2y / 32;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx >= (int16_t)width)  sx = (int16_t)width  - 1;
+    if (sy >= (int16_t)height) sy = (int16_t)height - 1;
+
+    for (i = 0; i < 4; i++) {
+        int16_t nx = (int16_t)(walk_item_prop_tx + adx[i]);
+        int16_t ny = (int16_t)(walk_item_prop_ty + ady[i]);
+        if (walk_item_tried_mask & (uint8_t)(1 << i))
+            continue;
+        walk_item_tried_mask |= (uint8_t)(1 << i);
+        if (nx < 0 || ny < 0 || nx >= (int16_t)width || ny >= (int16_t)height)
+            continue;
+        if (!walk_grid_walkable[(int)ny*(int)width + nx])
+            continue;
+        if (!walk_bfs(width, height, sx, sy, nx, ny, &new_len))
+            continue;
+        walk_target_x = nx;
+        walk_target_y = ny;
+        walk_path_len = new_len;
+        walk_path_idx = 0;
+        walk_item_round = 0;                /* fresh rounding budget per side */
+        walk_stall_ticks = 0;
+        walk_stall_px = guybrush[current_nation].px;
+        walk_stall_p2y = guybrush[current_nation].p2y;
+        walk_phase = WALK_PHASE_PATH;
+        return true;
+    }
+    return false;
+}
+
+/* Corner-rounding exhausted (all WALK_ITEM_ROUND_MAX rounds tried with no
+ * progress): first cycle to an untried approach side of the prop tile
+ * (walk_item_try_next_side above); only when every side has been tried,
+ * fall back to the generic sidestep-then-re-BFS recovery plain-tile
+ * PATH-phase stalls use (WALK_PHASE_SIDESTEP, gated by the shared
+ * walk_recovered one-shot latch); a further stall after that is blocked
+ * immediately. */
+static void walk_item_round_exhausted(int16_t px, int16_t p2y, bool primary_is_x)
+{
+    walk_item_rounding = false;
+    if (walk_item_try_next_side()) {
+        walk_release_keys();
+        return;
+    }
+    if (!walk_recovered) {
+        /* walk_target_x/y is still the item's (unreached) tile target at
+         * this point -- walk_item_try_next_side above already failed to
+         * find a next side, so it never reassigned them. Derive the
+         * primary retry direction (see walk_sidestep_primary_dir's header
+         * comment on walk_pump_sidestep) the same way PATH-phase's own
+         * SIDESTEP entry does, from that target tile's center. */
+        int16_t wcx = (int16_t)(walk_target_x * 32 + 16);
+        int16_t wcy = (int16_t)(walk_target_y * 32 + 16);
+        walk_recovered = true;
+        walk_phase = WALK_PHASE_SIDESTEP;
+        if (primary_is_x) {
+            walk_sidestep_dir[0] = WALK_DIR_DOWN;
+            walk_sidestep_dir[1] = WALK_DIR_UP;
+            walk_sidestep_primary_dir = (px < wcx) ? WALK_DIR_RIGHT : WALK_DIR_LEFT;
+        } else {
+            walk_sidestep_dir[0] = WALK_DIR_RIGHT;
+            walk_sidestep_dir[1] = WALK_DIR_LEFT;
+            walk_sidestep_primary_dir = (p2y < wcy) ? WALK_DIR_DOWN : WALK_DIR_UP;
+        }
+        walk_sidestep_idx = 0;
+        walk_sidestep_ticks = 0;
+        walk_hold_only(walk_dir_key(walk_sidestep_dir[0]));
+        walk_stall_ticks = 0;
+        walk_stall_px = px;
+        walk_stall_p2y = p2y;
+        return;
+    }
+    walk_cancel(WALK_BLOCKED);
+}
+
+/* Runs one tick of the current corner-rounding round (walk_pump_item_pixel
+ * dispatches here whenever walk_item_rounding is set). Uses the primary
+ * axis captured at the round's start (walk_item_round_primary_is_x), not
+ * a fresh per-tick recompute, so a momentary in-range dip on that axis
+ * mid-round doesn't reinterpret which direction is being sidestepped
+ * (brief: "temporary leaving of an in-range axis during rounding is
+ * allowed"). May recurse once, directly into the next round's first tick,
+ * when a re-attempt fails and another round is still available -- avoids
+ * wasting a whole tick on a no-op transition. */
+static void walk_pump_item_round(int16_t px, int16_t p2y,
+                                  int16_t dx, int16_t dy,
+                                  int16_t adx, int16_t ady)
+{
+    bool primary_is_x = walk_item_round_primary_is_x;
+    int16_t primary_dist = primary_is_x ? adx : ady;
+    uint8_t primary_key = primary_is_x
+        ? (dx < 0 ? walk_key_right : walk_key_left)
+        : (dy < 0 ? walk_key_down  : walk_key_up);
+
+    walk_item_round_ticks++;
+
+    if (walk_item_round_sidestepping) {
+        int16_t disp_x = (int16_t)(px - walk_item_round_ref_px);
+        int16_t disp_y = (int16_t)((p2y - walk_item_round_ref_p2y) / 2);
+        int16_t perp_disp = primary_is_x ? disp_y : disp_x;
+        int16_t aperp = (int16_t)(perp_disp < 0 ? -perp_disp : perp_disp);
+        uint8_t perp_key_a = primary_is_x ? walk_key_down : walk_key_right;
+        uint8_t perp_key_b = primary_is_x ? walk_key_up   : walk_key_left;
+        uint8_t perp_key = (walk_item_round_side == 0) ? perp_key_a : perp_key_b;
+
+        if (aperp >= walk_item_round_target_px[walk_item_round - 1] ||
+            walk_item_round_ticks >= WALK_ITEM_ROUND_SIDESTEP_CAP_TICKS) {
+            /* Sidestep done (or gave up because it's itself blocked) --
+             * move on to the re-attempt sub-step. */
+            walk_item_round_sidestepping = false;
+            walk_item_round_ticks = 0;
+            walk_item_round_best_dist = primary_dist;
+            walk_hold_only(primary_key);
+            return;
+        }
+        walk_hold_only(perp_key);
+        return;
+    }
+
+    /* Re-attempt sub-step: did pushing the primary direction again get any
+     * closer than it was right when the sidestep ended? */
+    if (primary_dist < walk_item_round_best_dist) {
+        walk_item_rounding = false;
+        walk_item_progress_axis_is_x = primary_is_x;
+        walk_item_progress_best = primary_dist;
+        walk_item_progress_ticks = 1;
+        walk_hold_only(primary_key);
+        return;
+    }
+    if (walk_item_round_ticks >= WALK_ITEM_ROUND_REATTEMPT_TICKS) {
+        if (walk_item_round < WALK_ITEM_ROUND_MAX) {
+            walk_item_start_round(px, p2y, primary_is_x);
+            walk_pump_item_round(px, p2y, dx, dy, adx, ady);
+            return;
+        }
+        walk_item_round_exhausted(px, p2y, primary_is_x);
+        return;
+    }
+    walk_hold_only(primary_key);
+}
+
+static void walk_pump_item_pixel(void)
+{
+    int16_t px, p2y, p2y_half, dx, dy, adx, ady;
+    bool x_ok, y_ok, primary_is_x;
+    int16_t primary_dist;
+
+    px = guybrush[current_nation].px;
+    p2y = guybrush[current_nation].p2y;
+    p2y_half = (int16_t)(p2y / 2);
+    dx = (int16_t)(px - walk_item_anchor_x);
+    dy = (int16_t)(p2y_half - walk_item_anchor_y);
+    adx = (int16_t)(dx < 0 ? -dx : dx);
+    ady = (int16_t)(dy < 0 ? -dy : dy);
+
+    x_ok = adx <= WALK_ITEM_MARGIN;
+    y_ok = ady <= WALK_ITEM_MARGIN;
+    if (x_ok && y_ok) {
+        walk_cancel(WALK_ARRIVED);
+        if (walk_item_pickup)
+            enqueue_key(KEY_INVENTORY_PICKUP, 100);
+        return;
+    }
+
+    if (walk_item_rounding) {
+        walk_pump_item_round(px, p2y, dx, dy, adx, ady);
+        return;
+    }
+
+    primary_is_x = adx > WALK_ITEM_DEADBAND;   /* x settled -> hand primary to y */
+    primary_dist = primary_is_x ? adx : ady;
+
+    if (walk_item_progress_axis_is_x != primary_is_x ||
+        primary_dist < walk_item_progress_best) {
+        walk_item_progress_axis_is_x = primary_is_x;
+        walk_item_progress_best = primary_dist;
+        walk_item_progress_ticks = 1;
+    } else {
+        walk_item_progress_ticks++;
+    }
+
+    if (walk_item_progress_ticks >= WALK_ITEM_PROGRESS_TICKS) {
+        if (walk_item_round < WALK_ITEM_ROUND_MAX) {
+            walk_item_start_round(px, p2y, primary_is_x);
+            walk_pump_item_round(px, p2y, dx, dy, adx, ady);
+            return;
+        }
+        walk_item_round_exhausted(px, p2y, primary_is_x);
+        return;
+    }
+
+    walk_hold_only(primary_is_x
+        ? (dx < 0 ? walk_key_right : walk_key_left)
+        : (dy < 0 ? walk_key_down  : walk_key_up));
 }
 
 /* Called every tick from agent_api_tick(), right after input_pump() (see
@@ -1321,8 +1773,9 @@ static void walk_pump(void)
      * phase-specific check of its own. */
     if (guybrush[current_nation].room != walk_room) { walk_cancel(WALK_ARRIVED); return; }
 
-    if (walk_phase == WALK_PHASE_CROSS)    { walk_pump_cross();    return; }
-    if (walk_phase == WALK_PHASE_SIDESTEP) { walk_pump_sidestep(); return; }
+    if (walk_phase == WALK_PHASE_CROSS)      { walk_pump_cross();      return; }
+    if (walk_phase == WALK_PHASE_SIDESTEP)   { walk_pump_sidestep();   return; }
+    if (walk_phase == WALK_PHASE_ITEM_PIXEL) { walk_pump_item_pixel(); return; }
 
     /* WALK_PHASE_PATH: follow the BFS path (Task 8 behavior), plus the
      * stall -> one-shot sidestep-recovery hook (part B) and the
@@ -1334,6 +1787,33 @@ static void walk_pump(void)
 
     if (px == walk_stall_px && p2y == walk_stall_p2y) {
         if (++walk_stall_ticks >= WALK_STALL_LIMIT) {
+            /* A final-waypoint stall on an item walk does NOT get the
+             * generic perpendicular-sidestep-then-re-BFS recovery below --
+             * that recovery re-paths back to this SAME coarse target tile,
+             * which is exactly what's unreachable (verified live: room
+             * 251's lockpick sits against a bunk bed whose collision mask
+             * fully blocks the straight tile-to-tile approach, on every
+             * column the generic sidestep can reach in its bounded time).
+             * Instead, hand off directly to WALK_PHASE_ITEM_PIXEL from
+             * wherever we're stalled: its pixel-window arrival test can
+             * already be satisfied without ever completing the coarse
+             * tile crossing (e.g. reachable by angling around the bed's
+             * corner into an adjacent tile column while still landing
+             * inside the anchor's 17px-wide window), and its own
+             * corner-rounding stall recovery (see walk_pump_item_round's
+             * header comment) is built for exactly this furniture-corner
+             * case, unlike the single-axis sidestep here. Uses the walk's
+             * one shared recovery attempt only if ITEM_PIXEL's own
+             * corner-rounding budget ends up exhausted, not this
+             * handoff. */
+            if (walk_is_item_target && walk_path_idx >= walk_path_len - 1) {
+                walk_phase = WALK_PHASE_ITEM_PIXEL;
+                walk_stall_ticks = 0;
+                walk_stall_px = px;
+                walk_stall_p2y = p2y;
+                walk_pump_item_pixel();
+                return;
+            }
             if (!walk_recovered && walk_path_idx < walk_path_len - 1) {
                 /* Non-final-waypoint stall, recovery not used yet:
                  * sidestep perpendicular to the current leg's direction
@@ -1343,14 +1823,19 @@ static void walk_pump(void)
                  * which axis was "primary" (blocked) and which is
                  * perpendicular (the way around). */
                 int16_t wtx = walk_path_x[walk_path_idx];
+                int16_t wty = walk_path_y[walk_path_idx];
+                int16_t wcx = (int16_t)(wtx * 32 + 16);
+                int16_t wcy = (int16_t)(wty * 32 + 16);
                 walk_recovered = true;
                 walk_phase = WALK_PHASE_SIDESTEP;
                 if (wtx != tile_x) {
                     walk_sidestep_dir[0] = WALK_DIR_DOWN;
                     walk_sidestep_dir[1] = WALK_DIR_UP;
+                    walk_sidestep_primary_dir = (px < wcx) ? WALK_DIR_RIGHT : WALK_DIR_LEFT;
                 } else {
                     walk_sidestep_dir[0] = WALK_DIR_RIGHT;
                     walk_sidestep_dir[1] = WALK_DIR_LEFT;
+                    walk_sidestep_primary_dir = (p2y < wcy) ? WALK_DIR_DOWN : WALK_DIR_UP;
                 }
                 walk_sidestep_idx = 0;
                 walk_sidestep_ticks = 0;
@@ -1392,6 +1877,19 @@ static void walk_pump(void)
             walk_pump_cross();
             return;
         }
+        if (walk_is_item_target) {
+            /* Target tile reached on an item walk: hand off to the
+             * pixel-precision ITEM_PIXEL phase rather than declaring
+             * arrived on tile precision alone (see its header comment).
+             * Fresh stall window for the new phase, same pattern the
+             * SIDESTEP->PATH resume above uses. */
+            walk_phase = WALK_PHASE_ITEM_PIXEL;
+            walk_stall_ticks = 0;
+            walk_stall_px = guybrush[current_nation].px;
+            walk_stall_p2y = guybrush[current_nation].p2y;
+            walk_pump_item_pixel();
+            return;
+        }
         walk_cancel(WALK_ARRIVED);
         return;
     }
@@ -1424,12 +1922,71 @@ static void walk_pump(void)
     }
 }
 
-/* POST /walk {"tile":[x,y]} | {"exit":N} | {"cancel":true}. See docs/
- * AGENT-API.md for the full contract. Any /input request that arrives
- * while a walk is in progress cancels the walk first (handle_input, per
- * the brief); any /walk request that arrives while the input queue is
- * busy is rejected with 409 rather than interleaving the two key-holding
- * mechanisms. */
+/* Looks up `name` in prop_name[1..NB_PROPS-1] (skipping ITEM_NONE), by
+ * exact match. Returns the item id, or -1 if `name` isn't a known prop
+ * name. Shared by the item-mode branch of handle_walk below. */
+static int item_id_for_name(const char* name)
+{
+    int j;
+    for (j = 1; j < NB_PROPS; j++)
+        if (!strcmp(prop_name[j], name))
+            return j;
+    return -1;
+}
+
+/* Finds item `item_id` among the CURRENT room's visible props (identical
+ * scan, skip conditions, and pixel-anchor formula as handle_room's `items`
+ * block -- see its comment for why: fair play means an item walk may only
+ * ever target a prop a human could actually see rendered on screen, same
+ * as /room already exposes and nothing more). On a match, fills
+ * *out_anchor_x/y (the exact pickup-trigger pixel anchor) and
+ * *out_tile_x/y (tile coordinates, NOT yet clamped to the room's own
+ * width/height -- the caller clamps, matching /room) and returns true. */
+static bool find_room_item(uint8_t item_id, bool outside,
+                            int16_t* out_anchor_x, int16_t* out_anchor_y,
+                            int16_t* out_tile_x, int16_t* out_tile_y)
+{
+    uint16_t u;
+    for (u = 0; u < nb_room_props; u++) {
+        uint16_t prop_offset = room_props[u];
+        uint8_t this_id;
+        uint16_t raw_x, raw_y;
+        int16_t itile_x, itile_y;
+
+        if (prop_offset == 0)
+            continue;
+        this_id = readbyte(fbuffer[OBJECTS], prop_offset + 7);
+        if (this_id != item_id)
+            continue;
+
+        raw_x = readword(fbuffer[OBJECTS], prop_offset + 4);
+        raw_y = readword(fbuffer[OBJECTS], prop_offset + 2);
+        itile_x = (int16_t)((raw_x - 15) / 32);
+        itile_y = (int16_t)((raw_y - 4) / 16);
+
+        if (outside) {
+            if (itile_x < 0 || itile_y < 0 ||
+                itile_x >= CMP_MAP_WIDTH || itile_y >= CMP_MAP_HEIGHT)
+                continue;
+            if (remove_props[itile_x][itile_y])
+                continue;
+        }
+
+        *out_anchor_x = (int16_t)(raw_x - 15);
+        *out_anchor_y = (int16_t)(raw_y - 4);
+        *out_tile_x = itile_x;
+        *out_tile_y = itile_y;
+        return true;
+    }
+    return false;
+}
+
+/* POST /walk {"tile":[x,y]} | {"exit":N} | {"item":"<name>","pickup":bool}
+ * | {"cancel":true}. See docs/AGENT-API.md for the full contract. Any
+ * /input request that arrives while a walk is in progress cancels the walk
+ * first (handle_input, per the brief); any /walk request that arrives
+ * while the input queue is busy is rejected with 409 rather than
+ * interleaving the two key-holding mechanisms. */
 static void handle_walk(int cfd, const char* body)
 {
     long a = 0, b = 0, exit_idx;
@@ -1437,7 +1994,10 @@ static void handle_walk(int cfd, const char* body)
     int16_t sx, sy, tx = 0, ty = 0;
     int snap, path_len = 0;
     bool is_exit_target;
-    char resp[80]; int n;
+    char item_name[24];
+    bool has_item = false, item_pickup = false;
+    int16_t item_anchor_x = 0, item_anchor_y = 0;
+    char resp[96]; int n;
 
     if (body) {
         const char* p = strstr(body, "\"cancel\"");
@@ -1454,50 +2014,152 @@ static void handle_walk(int cfd, const char* body)
         return;
     }
 
-    exit_idx = body ? json_int(body, "exit", -1) : -1;
-    if (exit_idx >= 0) {
+    has_item = body && json_str(body, "item", item_name, sizeof(item_name));
+    exit_idx = (!has_item && body) ? json_int(body, "exit", -1) : -1;
+
+    if (has_item) {
+        uint16_t room = guybrush[current_nation].room;
+        bool outside = (room == ROOM_OUTSIDE);
+        int item_id;
+        int16_t itile_x = 0, itile_y = 0;
+
+        {
+            const char* p = strstr(body, "\"pickup\"");
+            item_pickup = p && strstr(p, "true");
+        }
+
+        snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
+        if (snap == WALK_SNAP_NO_ROOM) {
+            static const char* unavail = "room data unavailable";
+            send_response(cfd, 400, "text/plain", unavail, strlen(unavail));
+            return;
+        }
+
+        item_id = item_id_for_name(item_name);
+        if (item_id < 0 ||
+            !find_room_item((uint8_t)item_id, outside,
+                             &item_anchor_x, &item_anchor_y, &itile_x, &itile_y)) {
+            static const char* noitem = "no such item here";
+            send_response(cfd, 400, "text/plain", noitem, strlen(noitem));
+            return;
+        }
+
+        /* Clamp to the room grid the same way /room's items block does,
+         * before indexing walk_grid_walkable[] with it. */
+        if (itile_x < 0) itile_x = 0;
+        if (itile_y < 0) itile_y = 0;
+        if (itile_x >= (int16_t)width)  itile_x = (int16_t)width  - 1;
+        if (itile_y >= (int16_t)height) itile_y = (int16_t)height - 1;
+
+        tx = itile_x; ty = itile_y;
+        walk_item_prop_tx = itile_x;
+        walk_item_prop_ty = itile_y;
+        walk_item_tried_mask = 0;
+
+        /* Optional "from":"e|w|s|n" approach-side hint (campaign knowledge
+         * from an earlier grab): start at that neighbor of the prop tile
+         * directly instead of discovering the good side by cycling. */
+        {
+            char from_hint[4] = "";
+            if (json_str(body, "from", from_hint, sizeof(from_hint))) {
+                static const int8_t hdx[4] = { 1, -1, 0, 0 };   /* e w s n */
+                static const int8_t hdy[4] = { 0, 0, 1, -1 };
+                const char* order = "ewsn";
+                const char* pos = strchr(order, (from_hint[0] | 0x20));
+                if (pos) {
+                    int hi = (int)(pos - order);
+                    int16_t hx = (int16_t)(itile_x + hdx[hi]);
+                    int16_t hy = (int16_t)(itile_y + hdy[hi]);
+                    if (hx >= 0 && hy >= 0 && hx < (int16_t)width &&
+                        hy < (int16_t)height &&
+                        walk_grid_walkable[(int)hy*(int)width + hx]) {
+                        tx = hx; ty = hy;
+                        walk_item_tried_mask = (uint8_t)(1 << hi);
+                    }
+                }
+            }
+        }
+
+        if (!walk_grid_walkable[(int)ty*(int)width + tx] && tx == itile_x && ty == itile_y) {
+            /* Prop's own tile is unwalkable (furniture/void underneath it)
+             * -- per the brief, fall back to the nearest walkable tile
+             * adjacent to it (4-neighborhood); no such neighbor -> no
+             * path, same 409 shape walk_bfs failure uses below. Mark the
+             * chosen side as tried so approach-side cycling starts from
+             * the next one. */
+            static const int8_t adx[4] = { 1, -1, 0, 0 };
+            static const int8_t ady[4] = { 0, 0, 1, -1 };
+            bool found_adj = false;
+            int i;
+            for (i = 0; i < 4; i++) {
+                int16_t nx = (int16_t)(itile_x + adx[i]);
+                int16_t ny = (int16_t)(itile_y + ady[i]);
+                if (nx < 0 || ny < 0 || nx >= (int16_t)width || ny >= (int16_t)height)
+                    continue;
+                if (walk_grid_walkable[(int)ny*(int)width + nx]) {
+                    tx = nx; ty = ny;
+                    walk_item_tried_mask = (uint8_t)(1 << i);
+                    found_adj = true;
+                    break;
+                }
+            }
+            if (!found_adj) {
+                static const char* nopath = "{\"error\":\"no path\"}";
+                send_response(cfd, 409, "application/json", nopath, strlen(nopath));
+                return;
+            }
+        }
+        /* An item walk is never a doorway crossing, regardless of whether
+         * the resolved tile happens to also be an exit cell. */
+        is_exit_target = false;
+    } else if (exit_idx >= 0) {
         snap = walk_snapshot_grid(&width, &height, (int)exit_idx, &tx, &ty);
+        is_exit_target = true;
     } else if (body && json_intpair(body, "tile", &a, &b)) {
         snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
         tx = (int16_t)a; ty = (int16_t)b;
+        is_exit_target = false;    /* refined below once walk_grid_isexit is known */
     } else {
-        static const char* need = "expected \"tile\":[x,y] or \"exit\":N";
+        static const char* need =
+            "expected \"tile\":[x,y], \"exit\":N, or \"item\":\"name\"";
         send_response(cfd, 400, "text/plain", need, strlen(need));
         return;
     }
 
-    if (snap == WALK_SNAP_NO_ROOM) {
-        static const char* unavail = "room data unavailable";
-        send_response(cfd, 400, "text/plain", unavail, strlen(unavail));
-        return;
-    }
-    if (snap == WALK_SNAP_BAD_EXIT) {
-        static const char* badexit = "invalid exit index";
-        send_response(cfd, 400, "text/plain", badexit, strlen(badexit));
-        return;
-    }
+    if (!has_item) {
+        if (snap == WALK_SNAP_NO_ROOM) {
+            static const char* unavail = "room data unavailable";
+            send_response(cfd, 400, "text/plain", unavail, strlen(unavail));
+            return;
+        }
+        if (snap == WALK_SNAP_BAD_EXIT) {
+            static const char* badexit = "invalid exit index";
+            send_response(cfd, 400, "text/plain", badexit, strlen(badexit));
+            return;
+        }
 
-    if (tx < 0 || ty < 0 || tx >= (int16_t)width || ty >= (int16_t)height) {
-        static const char* oob = "tile out of bounds";
-        send_response(cfd, 400, "text/plain", oob, strlen(oob));
-        return;
-    }
-    /* walk_grid_walkable already folds in exit cells (readexit & 0x1F) even
-     * when the underlying tile id is 0 -- see walk_snapshot_grid -- so an
-     * {"exit":N} target that lands on a void tile is still accepted here,
-     * matching /room's 'E' overlay on void cells. */
-    if (!walk_grid_walkable[(int)ty*(int)width + tx]) {
-        static const char* voidtile = "target is void tile";
-        send_response(cfd, 400, "text/plain", voidtile, strlen(voidtile));
-        return;
-    }
+        if (tx < 0 || ty < 0 || tx >= (int16_t)width || ty >= (int16_t)height) {
+            static const char* oob = "tile out of bounds";
+            send_response(cfd, 400, "text/plain", oob, strlen(oob));
+            return;
+        }
+        /* walk_grid_walkable already folds in exit cells (readexit & 0x1F)
+         * even when the underlying tile id is 0 -- see walk_snapshot_grid
+         * -- so an {"exit":N} target that lands on a void tile is still
+         * accepted here, matching /room's 'E' overlay on void cells. */
+        if (!walk_grid_walkable[(int)ty*(int)width + tx]) {
+            static const char* voidtile = "target is void tile";
+            send_response(cfd, 400, "text/plain", voidtile, strlen(voidtile));
+            return;
+        }
 
-    /* Part A: an explicit {"exit":N} request is always an exit walk; a
-     * {"tile":[x,y]} request is one too if it happens to land on an exit
-     * cell (walk_grid_isexit[], populated by the same scan that just
-     * built walk_grid_walkable[] above) -- gates the target-reached ->
-     * CROSSING-phase handoff in walk_pump. */
-    is_exit_target = (exit_idx >= 0) || walk_grid_isexit[(int)ty*(int)width + tx];
+        /* Part A: an explicit {"exit":N} request is always an exit walk; a
+         * {"tile":[x,y]} request is one too if it happens to land on an
+         * exit cell (walk_grid_isexit[], populated by the same scan that
+         * just built walk_grid_walkable[] above) -- gates the
+         * target-reached -> CROSSING-phase handoff in walk_pump. */
+        is_exit_target = is_exit_target || walk_grid_isexit[(int)ty*(int)width + tx];
+    }
 
     sx = guybrush[current_nation].px / 32;
     sy = guybrush[current_nation].p2y / 32;
@@ -1539,14 +2201,34 @@ static void handle_walk(int cfd, const char* body)
     walk_start_x = sx;
     walk_start_y = sy;
     walk_is_exit_target = is_exit_target;
+    /* Item-walk state (the /walk item+pickup feature): gates PATH-phase's
+     * target-reached handoff into WALK_PHASE_ITEM_PIXEL. Explicitly reset
+     * to false/0 for every non-item walk too, since these are persistent
+     * globals reused across /walk calls. */
+    walk_is_item_target = has_item;
+    walk_item_pickup = has_item && item_pickup;
+    walk_item_anchor_x = item_anchor_x;
+    walk_item_anchor_y = item_anchor_y;
+    walk_item_progress_axis_is_x = false;
+    walk_item_progress_best = 0;
+    walk_item_progress_ticks = 0;
+    walk_item_round = 0;
+    walk_item_rounding = false;
+    walk_item_round_sidestepping = false;
     walk_phase = WALK_PHASE_PATH;
     walk_recovered = false;
     walk_total_ticks = 0;
     walk_status = WALK_WALKING;
 
-    n = snprintf(resp, sizeof(resp),
-                 "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d}",
-                 (int)tx, (int)ty, path_len);
+    if (has_item)
+        n = snprintf(resp, sizeof(resp),
+                     "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d,"
+                     "\"item\":\"%s\"}",
+                     (int)tx, (int)ty, path_len, item_name);
+    else
+        n = snprintf(resp, sizeof(resp),
+                     "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d}",
+                     (int)tx, (int)ty, path_len);
     send_response(cfd, 202, "application/json", resp, (size_t)n);
 }
 
@@ -1587,21 +2269,36 @@ static void handle_request(int cfd)
         send_response(cfd, 404, "text/plain", "not found", 9);
 }
 
+/* Draining only one pending connection per tick (the original behavior)
+ * means a burst of back-to-back requests -- e.g. a test script or agent
+ * issuing several rapid sequential curls -- can outrun the accept() rate
+ * and pile up in the kernel's listen backlog; a connection that arrives
+ * right as the backlog is full is refused outright (client sees an empty
+ * reply, not an HTTP error, since nothing ever got far enough to call
+ * send_response). Draining a bounded batch per tick keeps each individual
+ * request's cost the same (still capped by SO_RCVTIMEO/SNDTIMEO and
+ * SEND_RESPONSE_DEADLINE_MS below) while making it very unlikely the
+ * backlog (now 16, see agent_api_init) ever actually fills under normal
+ * sequential-client usage. */
+#define AGENT_API_MAX_ACCEPTS_PER_TICK 8
+
 void agent_api_tick(void)
 {
     struct timeval tv = { 0, 200000 };  // 200 ms cap per request
-    int cfd;
+    int cfd, accepted;
     input_pump();   /* first: held keys release on schedule even with no
                      * client connected (and even if listen_fd is closed). */
     walk_pump();    /* right after input_pump: drives walk-held direction
                      * keys on the same per-tick cadence, independent of
                      * whether a client is connected this tick. */
     if (listen_fd < 0) return;
-    cfd = accept(listen_fd, NULL, NULL);
-    if (cfd < 0) return;
-    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    handle_request(cfd);
-    close(cfd);
+    for (accepted = 0; accepted < AGENT_API_MAX_ACCEPTS_PER_TICK; accepted++) {
+        cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) return;
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        handle_request(cfd);
+        close(cfd);
+    }
 }
 #endif
