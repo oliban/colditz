@@ -91,6 +91,42 @@ The objective is to **speedrun the escape**. Every run is timed.
   later runs are execution runs racing the optimized route. The brain
   announces splits via /say ("QUARTERS CLEARED 0:42") for the spectator.
 
+## Spectator interface & event bus
+
+- **Event bus:** all brain/errand actions flow through two wrappers in
+  `campaign/`: `cmd.sh` (wraps every game-API curl; logs
+  `{ts, type:"cmd", detail}` to `campaign/live-log.jsonl`, then executes)
+  and `log.sh` (brain events: `reason|say|split|run-start|run-stop`).
+  If a button was pressed, it is in the log by construction.
+- **Dashboard:** `campaign/dashboard/` — stdlib-only `server.py` +
+  `index.html` on 127.0.0.1:8900. Shows: live game view (proxied /screen,
+  ~2 fps), big RTA (client-ticked from run-start event) + IGT (polled
+  /state) timers, reasoning feed, and a command feed rendering each action
+  as a highlighted key-chip (e.g. `[→ RIGHT 800ms]`, `[WALK → exit 2]`).
+  Server proxies the game API (no CORS issues); localhost only.
+
+## Recording & speedrun-community compliance
+
+Researched community standards (speedrun.com general practice): single-
+segment RTA, video proof with no missing footage start-to-finish, rules
+documented per category, RTA primary + IGT alongside. No existing
+leaderboard for this game — we define and document our own category.
+
+- **Recording (proof-grade):** macOS `screencapture -v` records a screen
+  region containing the game window AND the dashboard side by side —
+  one continuous, unedited video per run with timer/reasoning/commands
+  visible live in-frame. Recorder starts before `run-timer.sh start` and
+  stops after `stop` (no missing footage). Output:
+  `campaign/recordings/run-N.mov`, linked from runs.md; a run without
+  complete video is invalid. Fallback (documented, non-proof-grade):
+  /screen-sampled frames + ffmpeg assembly.
+- **Category rules — `campaign/RULES.md`:** category "AI Any% (remake)":
+  engine remake (not original Amiga hardware) disclosed; play is AI-driven
+  (Fable brain + Haiku hands) via the fair-play API; timing starts at first
+  /state with intro:false, stops at first escaped:true; single segment; no
+  /control pause; no in-game save/load; full-run video required; route
+  knowledge across runs allowed.
+
 ## Failure handling
 
 - Errand ends in arrest/blocked: journal it, switch prisoner or re-plan.
