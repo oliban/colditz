@@ -122,3 +122,37 @@ directly (RTA 0:05, IGT 0:05 — see `/Users/fredriksafsten/games/colditz-escape
 mid-run (it isn't, per the no-pause rule above) — it was measured
 specifically to confirm IGT is a trustworthy secondary clock, not just a
 duplicate of RTA by coincidence of this one sample.
+
+## Spectator dashboard
+
+A live scoreboard for a human watching from across the room, and for
+side-by-side speedrun recordings next to the game window. It shows the
+game screen (refreshed ~500ms), big RTA/IGT timers, a REASONING feed
+("Fable's brain" — `reason`/`say`/`split`/run-start/run-stop events from
+`log.sh`), and a COMMANDS feed ("Haiku's hands" — every `/input`, `/walk`,
+`/say`, `/control` call made through `cmd.sh`, rendered as colored chips).
+
+**Start it:**
+
+```
+python3 /Users/fredriksafsten/games/colditz-escape/campaign/dashboard/server.py &
+```
+
+**URL:** http://127.0.0.1:8900/ (binds to localhost only; open in a
+browser window placed next to the game window for recording).
+
+Canonical source for these four files is versioned in the repo at
+`/Users/fredriksafsten/games/colditz-escape/src/docs/agent-play/dashboard-src/`
+(`cmd.sh`, `log.sh`, `server.py`, `index.html`) — the live copies that
+actually run are under `campaign/` (outside the repo) and
+`campaign/dashboard/`; keep both in sync if either is edited.
+
+**`cmd.sh`/`log.sh` are MANDATORY, not optional, for every brain/errand
+action during a run.** The dashboard and any recording only show what
+flows through `campaign/cmd.sh` (game API calls) and `campaign/log.sh`
+(reasoning/say/split/run-start/run-stop events) — a raw `curl` to
+`127.0.0.1:8765` or a thought never written via `log.sh` is invisible to
+a spectator and to the recording, even though it still affects the game.
+Direct-control moments (see above) go through `cmd.sh` exactly like
+errand-dispatched actions; there is no exemption for the brain acting
+directly.
