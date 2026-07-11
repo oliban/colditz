@@ -10,7 +10,9 @@ No external dependencies. Run with: python3 server.py
 """
 import json
 import os
+import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,8 +26,71 @@ DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
 CAMPAIGN_DIR = os.path.dirname(DASHBOARD_DIR)
 LOG_PATH = os.path.join(CAMPAIGN_DIR, "live-log.jsonl")
 INDEX_PATH = os.path.join(DASHBOARD_DIR, "index.html")
+RUNS_MD_PATH = os.path.join(CAMPAIGN_DIR, "runs.md")
+RECORDER_PATH = os.path.join(CAMPAIGN_DIR, "recorder.sh")
 
 GAME_TIMEOUT = 2.0  # seconds
+RECORDER_TIMEOUT = 10.0  # seconds; start's own permission probe takes ~3s
+
+
+def _next_run_number():
+    """Next run number = count of existing DATA rows in runs.md + 1.
+
+    Mirrors run-timer.sh's arithmetic exactly: runs.md has a header line
+    and a `|---|` separator line, both starting with `|`, so counting all
+    lines starting with `|` over-counts data rows by 2.
+    """
+    try:
+        with open(RUNS_MD_PATH, "r") as f:
+            pipe_lines = sum(1 for line in f if line.startswith("|"))
+    except OSError:
+        pipe_lines = 0
+    data_rows = max(pipe_lines - 2, 0)
+    return data_rows + 1
+
+
+def _run_recorder(args):
+    """Run recorder.sh with args, return (returncode, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", RECORDER_PATH] + args,
+            capture_output=True,
+            text=True,
+            timeout=RECORDER_TIMEOUT,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "recorder.sh timed out"
+    except OSError as e:
+        return -1, "", "could not run recorder.sh: %s" % e
+
+
+def _parse_recorder_status(stdout):
+    """Parse recorder.sh status's `key: value` lines into a dict."""
+    fields = {"state": "idle", "file": "", "error": ""}
+    for line in stdout.splitlines():
+        if ": " in line:
+            key, _, val = line.partition(": ")
+        elif line.endswith(":"):
+            key, val = line[:-1], ""
+        else:
+            continue
+        if key in fields:
+            fields[key] = val
+    return {
+        "recording": fields["state"] == "recording",
+        "file": fields["file"] or None,
+        "error": fields["error"] or None,
+    }
+
+
+def _append_log_event(entry_type, text):
+    entry = {"ts": round(time.time(), 3), "type": entry_type, "text": text}
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 def _proxy_game(path):
@@ -88,8 +153,65 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_state()
         elif path == "/api/screen":
             self._serve_screen()
+        elif path == "/api/record/status":
+            self._record_status()
         else:
             self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/record/start":
+            self._record_start()
+        elif path == "/api/record/stop":
+            self._record_stop()
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def _record_start(self):
+        body = self._read_json_body()
+        n = body.get("n")
+        if not isinstance(n, int) or n <= 0:
+            n = _next_run_number()
+
+        rc, out, err = _run_recorder(["start", str(n)])
+        rc2, out2, err2 = _run_recorder(["status"])
+        result = _parse_recorder_status(out2)
+        result["n"] = n
+        if result["recording"]:
+            _append_log_event("say", "RECORDING STARTED")
+        self._send_json(200, result)
+
+    def _record_stop(self):
+        rc0, out0, err0 = _run_recorder(["status"])
+        was_recording = _parse_recorder_status(out0)["recording"]
+
+        _run_recorder(["stop"])
+        rc, out, err = _run_recorder(["status"])
+        result = _parse_recorder_status(out)
+        if was_recording:
+            _append_log_event("say", "RECORDING STOPPED")
+        self._send_json(200, result)
+
+    def _record_status(self):
+        rc, out, err = _run_recorder(["status"])
+        result = _parse_recorder_status(out)
+        self._send_json(200, result)
 
     def _serve_index(self):
         try:

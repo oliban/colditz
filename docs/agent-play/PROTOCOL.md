@@ -56,9 +56,20 @@ A "run" is one fresh game launch, timed start to finish. Order matters:
    ```
 3. Dismiss the intro: `POST /input {"key":"action","ms":200}`, then poll
    `GET /state` until `intro:false`. Repeat the tap if it's still `true`.
-4. Start recording: `/Users/fredriksafsten/games/colditz-escape/campaign/recorder.sh start <N>` (built in a later
-   task — once it exists, this must run *before* the timer starts, so no
-   run footage is missing).
+4. **Check/announce REC state before a PB attempt.** Recording is
+   optional and toggled per run (dashboard REC button, default OFF, or
+   `/Users/fredriksafsten/games/colditz-escape/campaign/recorder.sh status`
+   from the CLI) — see `## Recording` below for full mechanics. Before
+   starting the timer on any run intended as a serious/PB attempt: confirm
+   REC is ON (toggle it on if it isn't, and confirm via `status` that it
+   actually started — `recorder.sh`/the dashboard fail loudly if Screen
+   Recording permission isn't granted) and announce the state via
+   `/say` or the reasoning log (e.g. "REC ON — PB attempt" or "REC OFF —
+   practice run"). Per `campaign/RULES.md`, **a run only counts as an
+   official/PB run if REC was on for the run's full duration**, so start
+   recording *before* the run timer and stop it *after* the run timer.
+   Practice/scout runs may skip recording entirely — journal them as
+   non-qualifying if so.
 5. Start the clock: `/Users/fredriksafsten/games/colditz-escape/campaign/run-timer.sh start` (call this at the first
    `/state` observed with `intro:false` — do not start it before the
    intro is actually dismissed, and do not delay it after).
@@ -66,13 +77,16 @@ A "run" is one fresh game launch, timed start to finish. Order matters:
    prisoner's `/state` shows `escaped:true`.
 7. Stop the clock immediately on the first `escaped:true` observed:
    `/Users/fredriksafsten/games/colditz-escape/campaign/run-timer.sh stop escaped "<route summary>"`.
-8. Stop recording: `/Users/fredriksafsten/games/colditz-escape/campaign/recorder.sh stop`.
-9. Journal the run in `/Users/fredriksafsten/games/colditz-escape/campaign/journal.md` (outcome, lessons) and fill in
-   `/Users/fredriksafsten/games/colditz-escape/campaign/runs.md`'s `video` column with the recording path for that
-   row (the run-timer already appended the row with RTA/IGT/outcome/route;
-   video is added after `recorder.sh stop` reports its output path).
-   Update the `PB` marker if this is the new best `escaped` run in its
-   category.
+8. If recording was on, stop it: dashboard REC toggle, or
+   `/Users/fredriksafsten/games/colditz-escape/campaign/recorder.sh stop`.
+9. Journal the run in `/Users/fredriksafsten/games/colditz-escape/campaign/journal.md` (outcome, lessons, and
+   whether it was PB-eligible per the REC-coverage rule) and, if recorded,
+   fill in `/Users/fredriksafsten/games/colditz-escape/campaign/runs.md`'s `video` column with the recording
+   path for that row (the run-timer already appended the row with
+   RTA/IGT/outcome/route; video is added after `recorder.sh stop` reports
+   its output path). Update the `PB` marker only if this run is both the
+   new best `escaped` time in its category AND was recorded start-to-stop
+   (see `campaign/RULES.md`).
 
 If the run ends some other way (arrest, abandoned, game crash) before
 `escaped:true`, still run `/Users/fredriksafsten/games/colditz-escape/campaign/run-timer.sh stop <outcome> "<note>"` and
@@ -123,6 +137,50 @@ mid-run (it isn't, per the no-pause rule above) — it was measured
 specifically to confirm IGT is a trustworthy secondary clock, not just a
 duplicate of RTA by coincidence of this one sample.
 
+## Recording
+
+Video proof is **optional per run**, toggled on/off — it is NOT wired
+into `run-timer.sh` and does not start/stop automatically. Default is
+OFF; you must explicitly turn it on.
+
+- **Dashboard toggle (normal path):** the spectator dashboard
+  (`http://127.0.0.1:8900/`) has a REC button next to the timers. Click
+  once to start (posts `/api/record/start`, which derives the next run
+  number from `campaign/runs.md`'s row count), click again to stop
+  (`/api/record/stop`). The button shows a red pulsing `● REC` plus the
+  output filename while recording, and the dashboard polls
+  `/api/record/status` every 2s so it can never drift from the truth
+  (e.g. if the recorder process dies mid-run). Any failure (most likely
+  missing OS permission — see below) is surfaced immediately in an amber
+  warning strip with the exact error text. Every successful start/stop
+  also appends a `RECORDING STARTED`/`RECORDING STOPPED` event to
+  `campaign/live-log.jsonl`, so it shows up in the reasoning feed and, if
+  the dashboard itself is in-frame, in the recording too.
+- **CLI equivalent:** `campaign/recorder.sh start <N>` / `stop` / `status`,
+  same underlying mechanism the dashboard shells out to (macOS
+  `screencapture -v`, region set via the `REGION` variable at the top of
+  the script — empty/default records the whole main display; set it to
+  `"x,y,w,h"` to cover a specific rect, e.g. game window + dashboard
+  window side by side, for a proof-grade compliant recording per
+  `campaign/RULES.md`). Output: `campaign/recordings/run-N.mov`. `status`
+  prints `state: recording|idle`, `file:`, and `error:` lines.
+- **Permission requirement:** recording requires macOS **Screen
+  Recording** permission, granted to whichever app/terminal is running
+  `recorder.sh` (directly, or indirectly via the dashboard's
+  `server.py`). Grant it at **System Settings -> Privacy & Security ->
+  Screen & System Audio Recording**. Without it, `screencapture -v` exits
+  immediately or produces a 0-byte file; `recorder.sh` detects this
+  within ~3 seconds, prints a loud terminal warning naming the exact
+  System Settings path, cleans up its PID file (no stale state), and
+  reports the failure through `status`'s `error:` field — which the
+  dashboard surfaces in its amber warning strip. A permission failure
+  does not block play; it just means the run cannot be PB-eligible (see
+  `campaign/RULES.md`) until permission is granted.
+- **PB eligibility:** per `campaign/RULES.md`, a run only counts as an
+  official/PB run if REC was ON for the run's *entire* duration (timer
+  start to timer stop, no gaps) — see Step 4/8 of the run procedure
+  above.
+
 ## Spectator dashboard
 
 A live scoreboard for a human watching from across the room, and for
@@ -141,11 +199,11 @@ python3 /Users/fredriksafsten/games/colditz-escape/campaign/dashboard/server.py 
 **URL:** http://127.0.0.1:8900/ (binds to localhost only; open in a
 browser window placed next to the game window for recording).
 
-Canonical source for these four files is versioned in the repo at
+Canonical source for these files is versioned in the repo at
 `/Users/fredriksafsten/games/colditz-escape/src/docs/agent-play/dashboard-src/`
-(`cmd.sh`, `log.sh`, `server.py`, `index.html`) — the live copies that
-actually run are under `campaign/` (outside the repo) and
-`campaign/dashboard/`; keep both in sync if either is edited.
+(`cmd.sh`, `log.sh`, `server.py`, `index.html`, `recorder.sh`, `RULES.md`)
+— the live copies that actually run are under `campaign/` (outside the
+repo) and `campaign/dashboard/`; keep both in sync if either is edited.
 
 **`cmd.sh`/`log.sh` are MANDATORY, not optional, for every brain/errand
 action during a run.** The dashboard and any recording only show what

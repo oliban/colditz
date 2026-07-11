@@ -118,6 +118,65 @@
     text-overflow: ellipsis;
   }
 
+  .rec-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  #rec-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--dim);
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  #rec-toggle:hover { border-color: var(--dim); color: var(--text); }
+  #rec-toggle .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--dim);
+    flex: 0 0 auto;
+  }
+  #rec-toggle.on {
+    background: rgba(255,93,93,0.14);
+    border-color: rgba(255,93,93,0.55);
+    color: var(--danger);
+  }
+  #rec-toggle.on .dot {
+    background: var(--danger);
+    box-shadow: 0 0 8px rgba(255,93,93,0.8);
+    animation: pulse 1s infinite;
+  }
+  #rec-toggle.pending { opacity: 0.6; cursor: wait; pointer-events: none; }
+  #rec-file {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rec-warn {
+    display: none;
+    background: rgba(246,196,83,0.16);
+    border: 1px solid rgba(246,196,83,0.5);
+    color: var(--accent-2);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.4;
+  }
+  .rec-warn.show { display: block; }
+
   .timers {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -282,6 +341,14 @@
     </div>
 
     <div class="status-msg" id="status-msg">&nbsp;</div>
+
+    <div class="rec-row">
+      <button type="button" id="rec-toggle">
+        <span class="dot"></span><span id="rec-label">REC OFF</span>
+      </button>
+      <span id="rec-file"></span>
+    </div>
+    <div class="rec-warn" id="rec-warn"></div>
 
     <div class="timers">
       <div class="timer-box" id="rta-box">
@@ -617,6 +684,73 @@
     probe.src = next;
   }
 
+  // ---------- recording toggle ----------
+  //
+  // Recording is OFF by default and only ever turned on by an explicit
+  // click. The button reflects the server's last-known truth: every click
+  // fires the start/stop request, and a 2s poll of /api/record/status keeps
+  // the UI honest even if the recorder fails asynchronously (e.g. dies
+  // mid-run) or another client toggled it.
+
+  let recRecording = false;
+  let recPending = false;
+
+  function basename(p) {
+    if (!p) return "";
+    const parts = String(p).split("/");
+    return parts[parts.length - 1];
+  }
+
+  function renderRec(state) {
+    const btn = document.getElementById("rec-toggle");
+    const label = document.getElementById("rec-label");
+    const fileEl = document.getElementById("rec-file");
+    const warnEl = document.getElementById("rec-warn");
+
+    recRecording = !!state.recording;
+    btn.classList.toggle("on", recRecording);
+    btn.classList.toggle("pending", recPending);
+    label.textContent = recRecording ? "● REC" : "REC OFF";
+    fileEl.textContent = recRecording ? basename(state.file) : "";
+
+    if (state.error) {
+      warnEl.textContent = "⚠ RECORDING: " + state.error;
+      warnEl.classList.add("show");
+    } else {
+      warnEl.classList.remove("show");
+      warnEl.textContent = "";
+    }
+  }
+
+  function pollRecordStatus() {
+    fetch("/api/record/status", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!recPending) renderRec(data);
+      })
+      .catch(function () { /* transient - next poll will retry */ })
+      .finally(function () { setTimeout(pollRecordStatus, 2000); });
+  }
+
+  function toggleRec() {
+    if (recPending) return;
+    recPending = true;
+    document.getElementById("rec-toggle").classList.add("pending");
+    const endpoint = recRecording ? "/api/record/stop" : "/api/record/start";
+    fetch(endpoint, { method: "POST", cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        recPending = false;
+        renderRec(data);
+      })
+      .catch(function () {
+        recPending = false;
+        document.getElementById("rec-toggle").classList.remove("pending");
+      });
+  }
+
+  document.getElementById("rec-toggle").addEventListener("click", toggleRec);
+
   // ---------- boot ----------
 
   setInterval(tickRta, 100);
@@ -624,5 +758,6 @@
   pollLog();
   pollState();
   refreshScreen();
+  pollRecordStatus();
 })();
 </script>
