@@ -69,6 +69,28 @@ plan → next errand. The brain takes direct control (curl from main session)
 only for high-stakes sequences: consuming keys on graded doors, tunnel
 entry, final escape run. The brain narrates strategy via /say.
 
+## Speedrun framing (the goal)
+
+The objective is to **speedrun the escape**. Every run is timed.
+
+- **Run definition:** one fresh game launch. Timing starts when prisoner
+  control is gained (intro dismissed, first /state with intro:false) and
+  stops at the first prisoner with `escaped: true` in /state (category:
+  Any% / first-out). A "full house" category (all four out) can be added
+  later.
+- **Clocks:** RTA (wall clock — brain timestamps run start/end via `date`)
+  and IGT (in-game time — `game_time` from /state, ms). Both recorded.
+- **Rules:** no /control pause during timed runs (it freezes IGT — allowed
+  only in untimed scout runs, and noted as such); fresh game process per
+  run; route knowledge from previous runs is allowed (standard speedrun
+  practice); fair-play API constraints always apply.
+- **Run log:** `campaign/runs.md` — one row per run: #, date, category,
+  RTA, IGT, outcome (escaped prisoner / arrest / abandoned), route summary,
+  personal best marker.
+- **Strategy consequence:** early runs are slow scout runs (build map.md);
+  later runs are execution runs racing the optimized route. The brain
+  announces splits via /say ("QUARTERS CLEARED 0:42") for the spectator.
+
 ## Failure handling
 
 - Errand ends in arrest/blocked: journal it, switch prisoner or re-plan.
