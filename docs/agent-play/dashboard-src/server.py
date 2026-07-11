@@ -10,6 +10,7 @@ No external dependencies. Run with: python3 server.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ LOG_PATH = os.path.join(CAMPAIGN_DIR, "live-log.jsonl")
 INDEX_PATH = os.path.join(DASHBOARD_DIR, "index.html")
 RUNS_MD_PATH = os.path.join(CAMPAIGN_DIR, "runs.md")
 RECORDER_PATH = os.path.join(CAMPAIGN_DIR, "recorder.sh")
+MAP_PATH = os.path.join(CAMPAIGN_DIR, "map.md")
 
 GAME_TIMEOUT = 2.0  # seconds
 RECORDER_TIMEOUT = 10.0  # seconds; start's own permission probe takes ~3s
@@ -93,6 +95,135 @@ def _append_log_event(entry_type, text):
         pass
 
 
+# ---------- map.md parsing ----------
+#
+# Tolerant, line-by-line regex parse. Any line that doesn't match a known
+# shape is skipped rather than raising - the source doc is hand-edited
+# free text and formatting drifts over time.
+
+_ROOM_HEADER_RE = re.compile(r'^###\s*Room\s+(\d+)\s*(?:\(([^)]*)\))?', re.IGNORECASE)
+_EXITS_LINE_RE = re.compile(r'^-\s*exits\s*:\s*(.+)$', re.IGNORECASE)
+_EXIT_TOKEN_RE = re.compile(r'^\[\s*(\d+)\s*,\s*(\d+)\s*\]\s*->\s*(.+)$')
+_EXIT_ROOM_RE = re.compile(r'^room\s+(\d+)\b(.*)$', re.IGNORECASE)
+_EXIT_BLOCKED_RE = re.compile(r'^blocked\s*(?:\(([^)]*)\))?', re.IGNORECASE)
+_EXIT_UNTESTED_RE = re.compile(r'^untested', re.IGNORECASE)
+_GRAPH_EDGE_RE = re.compile(
+    r'^-\s*room\s+(\d+)\s*--\[\s*tile\s+(\d+)\s*,\s*(\d+)\s*\]-->\s*room\s+(\d+)',
+    re.IGNORECASE,
+)
+
+
+def _parse_map():
+    """Parse campaign/map.md into {"rooms": [...], "edges": [...]}.
+
+    rooms: list (file/discovery order) of
+      {"id": int, "label": str, "exits": [
+          {"tile": [x,y], "status": "open", "to": int, "internal": bool} |
+          {"tile": [x,y], "status": "blocked", "to": None, "note": str} |
+          {"tile": [x,y], "status": "untested", "to": None}
+      ]}
+    edges: deduped list of {"from": int, "to": int, "tile": [x,y]} - the
+      union of "## Castle graph" edges and open exits found in room
+      sections (a room's exits are the ground truth; the graph section is
+      a cross-check/summary and may lag behind or lead it).
+    """
+    try:
+        with open(MAP_PATH, "r") as f:
+            lines = f.readlines()
+    except OSError:
+        return {"rooms": [], "edges": []}
+
+    rooms = []
+    rooms_by_id = {}
+    edges = []
+    edge_keys = set()
+    current_room = None
+
+    def ensure_room(rid):
+        room = rooms_by_id.get(rid)
+        if room is None:
+            room = {"id": rid, "label": "", "exits": []}
+            rooms.append(room)
+            rooms_by_id[rid] = room
+        return room
+
+    def add_edge(frm, to, tile):
+        key = (frm, to, tuple(tile))
+        if key in edge_keys:
+            return
+        edge_keys.add(key)
+        edges.append({"from": frm, "to": to, "tile": list(tile)})
+
+    for raw in lines:
+        stripped = raw.strip()
+
+        m = _ROOM_HEADER_RE.match(stripped)
+        if m:
+            rid = int(m.group(1))
+            label = (m.group(2) or "").strip()
+            room = ensure_room(rid)
+            room["label"] = label
+            current_room = room
+            continue
+
+        m = _EXITS_LINE_RE.match(stripped)
+        if m and current_room is not None:
+            for token in m.group(1).split("|"):
+                token = token.strip()
+                tm = _EXIT_TOKEN_RE.match(token)
+                if not tm:
+                    continue
+                tx, ty, rest = tm.groups()
+                tile = [int(tx), int(ty)]
+                rest = rest.strip()
+
+                rm = _EXIT_ROOM_RE.match(rest)
+                if rm:
+                    to = int(rm.group(1))
+                    internal = "internal" in rm.group(2).lower()
+                    current_room["exits"].append({
+                        "tile": tile, "status": "open", "to": to,
+                        "internal": internal,
+                    })
+                    ensure_room(to)
+                    add_edge(current_room["id"], to, tile)
+                    continue
+
+                bm = _EXIT_BLOCKED_RE.match(rest)
+                if bm:
+                    current_room["exits"].append({
+                        "tile": tile, "status": "blocked", "to": None,
+                        "note": bm.group(1) or "",
+                    })
+                    continue
+
+                um = _EXIT_UNTESTED_RE.match(rest)
+                if um:
+                    current_room["exits"].append({
+                        "tile": tile, "status": "untested", "to": None,
+                    })
+                    continue
+
+                # unrecognised exit destination text - skip gracefully
+            continue
+
+        gm = _GRAPH_EDGE_RE.match(stripped)
+        if gm:
+            frm, tx, ty, to = gm.groups()
+            frm = int(frm)
+            to = int(to)
+            tile = [int(tx), int(ty)]
+            ensure_room(frm)
+            ensure_room(to)
+            add_edge(frm, to, tile)
+            continue
+
+        # any other line (prose, "## Castle graph" heading, items/guards
+        # lines, blank lines, etc.) - ignored
+
+    return {"rooms": rooms, "edges": edges}
+
+
 def _proxy_game(path):
     """GET a path from the game API. Returns (status, content_type, bytes)."""
     url = GAME_API + path
@@ -153,6 +284,10 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_state()
         elif path == "/api/screen":
             self._serve_screen()
+        elif path == "/api/map":
+            self._serve_map()
+        elif path == "/api/room":
+            self._serve_room()
         elif path == "/api/record/status":
             self._record_status()
         else:
@@ -265,6 +400,19 @@ class Handler(BaseHTTPRequestHandler):
             self._game_offline("could not reach game API at " + GAME_API)
             return
         self._send_bytes(status, ctype or "image/png", body)
+
+    def _serve_map(self):
+        # Parsed fresh from disk on every request (~1/s polling from the
+        # client) - map.md is small and this keeps the dashboard in sync
+        # with the exploring agent's latest writes with zero caching bugs.
+        self._send_json(200, _parse_map())
+
+    def _serve_room(self):
+        status, ctype, body = _proxy_game("/room")
+        if status is None:
+            self._game_offline("could not reach game API at " + GAME_API)
+            return
+        self._send_bytes(status, ctype or "application/json", body)
 
 
 def main():
