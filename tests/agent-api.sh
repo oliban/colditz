@@ -88,13 +88,30 @@ assert all(len(row) == r['width'] for row in r['grid'])
 assert set(''.join(r['grid'])) <= set('.#E')
 tx, ty = r['my_tile']
 assert 0 <= tx < r['width'] and 0 <= ty < r['height']
-# fair play: no forbidden knowledge anywhere in the payload
+# fair play: no forbidden knowledge anywhere in the payload. 'prop' and
+# 'key' are no longer forbidden substrings -- Task 9 adds an "items" list
+# whose prop names (e.g. "key_one", "lockpick") legitimately contain them;
+# what must never appear is lock/grade/open-state knowledge.
 raw = open('/tmp/room.json').read()
-for word in ('locked','grade','open','prop','key'):
+for word in ('locked','grade','open'):
     assert word not in raw, f"cheating field: {word}"
 EOF
 
-# 10. /walk to first exit eventually changes room or reports blocked
+# 9b. /room items: current-room props only, type-checked (content may
+# legitimately be empty in the fresh-start room)
+python3 - <<'EOF' && pass "/room items" || fail "/room items"
+import json
+r = json.load(open('/tmp/room.json'))
+assert isinstance(r['items'], list)
+for it in r['items']:
+    assert isinstance(it['name'], str) and it['name']
+    x, y = it['tile']
+    assert 0 <= x < r['width'] and 0 <= y < r['height']
+EOF
+
+# 10. /walk-through exit: from the fresh-start room, POST {"exit":0} must
+# end with status "arrived" AND an actual room change in ONE call -- no
+# manual follow-up nudge (replaces the old threshold-arrival contract).
 # Test 7's unpause needs a long injected KEY_PAUSE hold to bridge the pause
 # screen's ~2s fade-transition (see /control's handle_control comment) --
 # drain that before exercising /walk's own "input busy" precondition, same
@@ -104,17 +121,23 @@ for i in $(seq 1 20); do
   [ "$Q" = "0" ] && break
   sleep 0.2
 done
-EXIT_TILE=$(curl -s http://127.0.0.1:$PORT/room | python3 -c "import json,sys; r=json.load(sys.stdin); e=r['exits'][0]['tile']; print(f'{e[0]},{e[1]}')")
 ROOM0=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['prisoners'][0]['room'])")
-CODE=$(curl -s -o /tmp/walk.json -w '%{http_code}' -X POST -d "{\"tile\":[${EXIT_TILE%,*},${EXIT_TILE#*,}]}" http://127.0.0.1:$PORT/walk)
+CODE=$(curl -s -o /tmp/walk.json -w '%{http_code}' -X POST -d '{"exit":0}' http://127.0.0.1:$PORT/walk)
 [ "$CODE" = "202" ] && pass "/walk accepted" || fail "/walk returned $CODE"
-for i in $(seq 1 20); do
+# Poll up to 30s (the walk's own hard cap) -- path time plus the crossing
+# phase's up-to-~3.2s direction-alternation budget plus one possible stall
+# recovery attempt can legitimately take a few seconds.
+for i in $(seq 1 60); do
   sleep 0.5
   W=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['walk'])")
   [ "$W" != "walking" ] && break
 done
 ROOM1=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['prisoners'][0]['room'])")
-if [ "$W" = "arrived" ] || [ "$ROOM1" != "$ROOM0" ]; then pass "/walk completed ($W, room $ROOM0 -> $ROOM1)"; else fail "/walk ended '$W' room unchanged"; fi
+if [ "$W" = "arrived" ] && [ "$ROOM1" != "$ROOM0" ]; then
+  pass "/walk-through exit completed ($W, room $ROOM0 -> $ROOM1)"
+else
+  fail "/walk-through exit ended '$W' room $ROOM0 -> $ROOM1 (expected arrived + room change)"
+fi
 
 # 11. /walk rejects garbage
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"tile":[999,999]}' http://127.0.0.1:$PORT/walk)

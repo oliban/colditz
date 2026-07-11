@@ -38,6 +38,13 @@ static int listen_fd = -1;
 extern uint16_t room_x, room_y;
 extern uint32_t offset;
 
+/* Same pattern: remove_props is a game.c global (not declared extern in
+ * colditz.h), used by set_props_overlays() (game.c:1001) to hide a prop
+ * overlay covered by a removable outside wall. /room's items list mirrors
+ * that same visibility test (see handle_room) so it only ever reports
+ * props the renderer would actually draw. */
+extern uint8_t remove_props[CMP_MAP_WIDTH][CMP_MAP_HEIGHT];
+
 /* Grow-on-demand buffer used by the stb PNG-encode write callback. Declared
  * once at file scope (rather than duplicated locally in png_append and
  * handle_screen) so both share the identical definition. */
@@ -67,6 +74,12 @@ void agent_api_init(uint16_t port)
     }
     fcntl(listen_fd, F_SETFL, O_NONBLOCK);
     agent_api_enabled = true;
+    /* stb's default PNG compression level (8) is slow enough on a full
+     * frame to cause a visible hitch on the game's own render thread when
+     * a dashboard polls /screen at any real cadence. Level 1 trades file
+     * size (still well within send_response's deadline) for speed -- see
+     * docs/AGENT-API.md for the measured size delta. */
+    stbi_write_png_compression_level = 1;
     printf("agent_api: listening on 127.0.0.1:%u\n", port);
 }
 
@@ -556,12 +569,17 @@ static void handle_state(int cfd)
 static char room_buf[32768];
 
 /* GET /room: the current room's *visible* geometry only -- walkable floor
- * grid, exit tile coordinates, and the prisoner's own tile. Fair-play
- * mandate (user-specified, non-negotiable): never expose anything a human
- * player can't see on screen. In particular this never reads/emits door
- * locked/open flags, key grades, props, or any other-room data -- an agent
- * learns whether a door is locked the same way a human does, by trying it.
- * We also only ever serve the CURRENT room: the readtile()/readexit()
+ * grid, exit tile coordinates, the prisoner's own tile, and (Task 9) the
+ * current room's visible item props. Fair-play mandate (user-specified,
+ * non-negotiable): never expose anything a human player can't see on
+ * screen. In particular this never reads/emits door locked/open flags,
+ * key grades, or any other-room data -- an agent learns whether a door is
+ * locked the same way a human does, by trying it. Room props ARE exposed
+ * (name + tile only, see the `items` block below) because they're
+ * rendered on screen exactly like the floor grid is -- reading their
+ * name/position is no more of a look-ahead than /room's grid already is;
+ * what stays hidden is any lock/hidden/other-room state, same as for
+ * exits. We also only ever serve the CURRENT room: the readtile()/readexit()
  * macros key off is_outside, which itself tests current_room_index, so
  * serving an arbitrary room index would desync is_outside from the data
  * actually being read (and would also let an agent see rooms it hasn't
@@ -581,6 +599,7 @@ static void handle_room(int cfd)
     uint16_t width, height;
     int16_t tile_x, tile_y;
     int n = 0, x, y;
+    uint16_t u;
     bool first;
 
     if (!outside) {
@@ -653,6 +672,66 @@ static void handle_room(int cfd)
             }
         }
     }
+    n = json_append(room_buf, sizeof(room_buf), n, "],\"items\":[");
+
+    /* Items: the CURRENT room's pickable props, by name+tile -- the same
+     * data set_props_overlays() (game.c:954-1005) draws every frame, read
+     * the same way. nb_room_props/room_props[] are already scoped to
+     * current_room_index (== guybrush[current_nation].room, see colditz.h's
+     * #define) by set_room_props(), refreshed on every room/nation switch
+     * -- so, like readtile/readexit, this is only ever self-consistent for
+     * the room we already validated above; no extra room-index handling
+     * needed. Fair-play: only name (via the same prop_name[] table /state
+     * already exposes) and tile position -- no lock/hidden/other-room
+     * state, and nothing here is data a human standing in this room
+     * couldn't also see on screen. */
+    first = true;
+    for (u = 0; u < nb_room_props; u++) {
+        uint16_t prop_offset = room_props[u];
+        uint8_t item_id;
+        uint16_t raw_x, raw_y;
+        int16_t itile_x, itile_y;
+
+        if (prop_offset == 0)
+            continue;   /* picked up since the last set_room_props() call */
+
+        item_id = readbyte(fbuffer[OBJECTS], prop_offset + 7);
+        if (item_id == ITEM_NONE || item_id >= NB_PROPS)
+            continue;   /* defensive: never index prop_name[] out of range */
+
+        /* Same pixel-position formula set_props_overlays() uses for its
+         * own draw position (x = raw_x-15, y = raw_y-4), converted to tile
+         * coordinates the same way my_tile is (divide by the tile pixel
+         * size on each axis -- 32 for x, 16 for y since these words store
+         * a py-equivalent, not p2y, value: main.c's drop handler writes
+         * prisoner_2y/2+4 here, matching prop_offset+2's read-back). */
+        raw_x = readword(fbuffer[OBJECTS], prop_offset + 4);
+        raw_y = readword(fbuffer[OBJECTS], prop_offset + 2);
+        itile_x = (int16_t)((raw_x - 15) / 32);
+        itile_y = (int16_t)((raw_y - 4) / 16);
+
+        /* Outside map only: a prop can be covered by a removable wall,
+         * exactly the check set_props_overlays() makes before adding its
+         * overlay (game.c:1001) -- skip it here too so /room never reports
+         * a prop the renderer wouldn't actually draw. */
+        if (outside) {
+            if (itile_x < 0 || itile_y < 0 ||
+                itile_x >= CMP_MAP_WIDTH || itile_y >= CMP_MAP_HEIGHT)
+                continue;
+            if (remove_props[itile_x][itile_y])
+                continue;
+        }
+
+        if (itile_x < 0) itile_x = 0;
+        if (itile_y < 0) itile_y = 0;
+        if (itile_x >= (int16_t)width)  itile_x = (int16_t)width  - 1;
+        if (itile_y >= (int16_t)height) itile_y = (int16_t)height - 1;
+
+        n = json_append(room_buf, sizeof(room_buf), n,
+            "%s{\"name\":\"%s\",\"tile\":[%d,%d]}", first ? "" : ",",
+            prop_name[item_id], (int)itile_x, (int)itile_y);
+        first = false;
+    }
     n = json_append(room_buf, sizeof(room_buf), n, "]}");
 
     room_x = saved_room_x;
@@ -678,7 +757,16 @@ static void handle_room(int cfd)
  * key-hold state machine. See docs/AGENT-API.md for the fair-play note:
  * BFS treats every nonzero tile (including exit cells) as walkable, so a
  * walk can be accepted toward, and end blocked at, a locked door -- no
- * door/exit status is ever read here, same mandate as /room. */
+ * door/exit status is ever read here, same mandate as /room.
+ *
+ * Task 9 additions (see the WALK_PHASE_* block further down for the
+ * design overview): (A) an exit-tile walk doesn't stop at the doorway's
+ * threshold -- reaching it enters a CROSSING phase that holds an outward
+ * direction key until the room actually changes, so `arrived` on an exit
+ * walk now always means the room changed. (B) a stall on a non-final
+ * waypoint gets one sidestep-and-re-path recovery attempt before being
+ * declared blocked. (C) the whole walk (any combination of phases) is
+ * capped at 30s wall-clock. */
 
 /* Largest grid the BFS ever has to path over: the outside compressed map
  * (CMP_MAP_WIDTH x CMP_MAP_HEIGHT = 84x72). Real indoor rooms are far
@@ -694,6 +782,22 @@ static void handle_room(int cfd)
  * mid-walk engine reads/writes happening elsewhere in the same tick. */
 static bool walk_grid_walkable[WALK_MAX_CELLS];
 
+/* Parallel snapshot: which cells are exit/doorway cells (readexit(x,y) &
+ * 0x1F != 0), taken at the same time as walk_grid_walkable[] by the same
+ * scan in walk_snapshot_grid(). Read-only after that, same as
+ * walk_grid_walkable[] -- used by the CROSSING-phase outward-direction
+ * heuristic (walk_exit_dir_candidates) so it never has to re-touch engine
+ * state (room_x/room_y/offset) mid-walk. Only the exit index's low 5 bits'
+ * nonzero-ness, same fair-play test /room and walk_grid_walkable already
+ * use -- never door/exit status (locked/grade). */
+static bool walk_grid_isexit[WALK_MAX_CELLS];
+
+/* Dimensions of the walk_grid_walkable/isexit snapshot currently in
+ * effect, persisted (not just a handle_walk local) so the CROSSING and
+ * SIDESTEP-recovery phases -- which run over multiple ticks, long after
+ * handle_walk returned -- can keep indexing the same snapshot correctly. */
+static uint16_t walk_width = 0, walk_height = 0;
+
 /* Waypoint path (tiles strictly after the start tile, through the target
  * inclusive), and the pump's cursor into it. int16_t is ample: tile
  * coordinates never exceed WALK_MAX_W/H. */
@@ -701,6 +805,22 @@ static int16_t walk_path_x[WALK_MAX_CELLS];
 static int16_t walk_path_y[WALK_MAX_CELLS];
 static int walk_path_len = 0;
 static int walk_path_idx = 0;
+
+/* The walk's ultimate target tile, persisted independent of walk_path_*
+ * (which gets overwritten by a mid-walk stall-recovery re-path) so a
+ * recovery attempt always re-BFS's toward the *original* target, and so
+ * the CROSSING-phase direction heuristic has a stable (ex,ey) even for a
+ * zero-length path (target tile == start tile, e.g. an {"exit":N} request
+ * issued while already standing on that exit tile). */
+static int16_t walk_target_x = 0, walk_target_y = 0;
+static int16_t walk_start_x = 0, walk_start_y = 0;
+
+/* True when the walk's target is an exit/doorway cell (set at accept time
+ * in handle_walk, from either an explicit {"exit":N} request or a
+ * {"tile":[x,y]} landing on walk_grid_isexit[]) -- gates whether reaching
+ * the target tile enters the CROSSING phase (part A) or ends the walk
+ * immediately as arrived (plain-tile walks, unchanged Task 8 behavior). */
+static bool walk_is_exit_target = false;
 
 /* Snapshot of "who/where" taken at walk start, so the pump can detect a
  * prisoner switch or room change without re-reading engine globals it
@@ -720,6 +840,61 @@ static int walk_stall_ticks = 0;
  * flap direction keys on/off every tick once the prisoner is already
  * close enough to center. */
 #define WALK_DEADBAND 6
+
+/* ---- Task 9: walk-through exits (A) + stall auto-recovery (B) ----
+ *
+ * The pump's tick state machine gains two extra phases beyond the
+ * original "follow the BFS path" behavior (kept as WALK_PHASE_PATH):
+ *
+ *  - WALK_PHASE_CROSS: entered when the target tile of an exit walk is
+ *    reached. Holds an "outward" direction key (see
+ *    walk_exit_dir_candidates below) until the room changes (arrived) or
+ *    the crossing attempt's time budget runs out (blocked).
+ *  - WALK_PHASE_SIDESTEP: entered on the walk's first stall while still
+ *    en route to a non-final waypoint. Nudges perpendicular to the
+ *    current leg's direction of travel for a bounded time, then re-BFS's
+ *    from wherever that left the prisoner to the ORIGINAL target on a
+ *    fresh grid snapshot, and resumes WALK_PHASE_PATH. One recovery per
+ *    walk (walk_recovered latches after the first attempt); a second
+ *    stall (or a stall on the final waypoint) is blocked immediately, as
+ *    before Task 9.
+ *
+ * All three phases terminate exclusively through walk_cancel() (called
+ * from walk_pump's shared per-tick preamble below), so the single
+ * key-release choke point from Task 8 still holds for every new
+ * termination path this adds. */
+typedef enum { WALK_PHASE_PATH, WALK_PHASE_CROSS, WALK_PHASE_SIDESTEP } walk_phase_t;
+static walk_phase_t walk_phase = WALK_PHASE_PATH;
+
+/* One recovery attempt per walk (part B); reset in handle_walk. */
+static bool walk_recovered = false;
+
+/* Whole-walk (all phases combined) hard cap: 30s / 16ms/tick. Protects
+ * against any pathological loop across path-following, sidestep-recovery,
+ * and crossing all taking their maximum time in sequence. */
+#define WALK_MAX_TICKS (30000 / 16)
+static int walk_total_ticks = 0;
+
+/* Cardinal direction, used by both the CROSSING and SIDESTEP phases to
+ * name which single key is held. */
+typedef enum { WALK_DIR_UP, WALK_DIR_DOWN, WALK_DIR_LEFT, WALK_DIR_RIGHT } walk_dir_t;
+
+/* CROSSING phase state: up to 2 candidate outward directions (see
+ * walk_exit_dir_candidates), alternated a bounded number of rounds. */
+#define WALK_CROSS_LEG_TICKS 50   /* ~0.8s per candidate direction */
+#define WALK_CROSS_MAX_ROUNDS 2
+static walk_dir_t walk_cross_cand[2];
+static int walk_cross_ncand = 0;
+static int walk_cross_idx = 0;
+static int walk_cross_round = 0;
+static int walk_cross_ticks = 0;
+
+/* SIDESTEP (recovery) phase state: try one perpendicular side, then the
+ * other, each for a bounded time, before re-pathing. */
+#define WALK_SIDESTEP_LEG_TICKS 25   /* ~0.4s per side */
+static walk_dir_t walk_sidestep_dir[2];
+static int walk_sidestep_idx = 0;
+static int walk_sidestep_ticks = 0;
 
 enum { WALK_SNAP_OK = 0, WALK_SNAP_NO_ROOM, WALK_SNAP_BAD_EXIT };
 
@@ -764,10 +939,10 @@ static int walk_snapshot_grid(uint16_t* out_width, uint16_t* out_height,
 
     for (y = 0; y < (int)height; y++) {
         for (x = 0; x < (int)width; x++) {
-            walk_grid_walkable[y*(int)width + x] =
-                (readtile(x, y) != 0) || ((readexit(x, y) & 0x1F) != 0);
-            if (exit_index >= 0 && !found_exit &&
-                (readexit(x, y) & 0x1F) != 0) {
+            bool is_exit = (readexit(x, y) & 0x1F) != 0;
+            walk_grid_walkable[y*(int)width + x] = (readtile(x, y) != 0) || is_exit;
+            walk_grid_isexit[y*(int)width + x] = is_exit;
+            if (exit_index >= 0 && !found_exit && is_exit) {
                 if (seen == exit_index) {
                     *exit_x = (int16_t)x; *exit_y = (int16_t)y;
                     found_exit = true;
@@ -862,11 +1037,268 @@ static bool json_intpair(const char* body, const char* field, long* a, long* b)
     return true;
 }
 
+/* ---- Task 9 direction helpers (used by CROSSING and SIDESTEP phases) --- */
+
+static uint8_t walk_dir_key(walk_dir_t d)
+{
+    switch (d) {
+        case WALK_DIR_UP:   return walk_key_up;
+        case WALK_DIR_DOWN: return walk_key_down;
+        case WALK_DIR_LEFT: return walk_key_left;
+        default:            return walk_key_right;   /* WALK_DIR_RIGHT */
+    }
+}
+
+/* Releases all four walk-held direction keys except `code`, then presses
+ * `code` -- the single-key-at-a-time hold used by both the CROSSING (one
+ * outward direction) and SIDESTEP (one perpendicular direction) phases,
+ * as opposed to PATH-phase steering below, which can hold two axes at
+ * once for diagonal motion. */
+static void walk_hold_only(uint8_t code)
+{
+    uint8_t keys[4] = { walk_key_up, walk_key_down, walk_key_left, walk_key_right };
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (keys[i] == code) {
+            key_down[keys[i]] = true;
+        } else {
+            key_down[keys[i]] = false;
+            key_readonce[keys[i]] = false;
+        }
+    }
+}
+
+/* Does direction `d`, taken from exit tile (ex,ey), lead off the current
+ * room's grid or into a non-walkable (void/wall) neighbor cell? This is
+ * the brief's geometry-only outward-direction test: the doorway's
+ * "outward" side is the one that does NOT lead to more walkable floor
+ * within this room (walking further into the room is the opposite of
+ * crossing the exit). Reads only walk_grid_walkable[] -- the same
+ * fair-play floor snapshot /room's grid and the BFS already use; never
+ * touches exit lock/grade state. */
+static bool walk_dir_qualifies(int16_t ex, int16_t ey, walk_dir_t d)
+{
+    int16_t nx = ex, ny = ey;
+    switch (d) {
+        case WALK_DIR_UP:    ny--; break;
+        case WALK_DIR_DOWN:  ny++; break;
+        case WALK_DIR_LEFT:  nx--; break;
+        case WALK_DIR_RIGHT: nx++; break;
+    }
+    if (nx < 0 || ny < 0 || nx >= (int16_t)walk_width || ny >= (int16_t)walk_height)
+        return true;   /* off-grid: edge-of-map exit */
+    return !walk_grid_walkable[(int)ny*(int)walk_width + nx];
+}
+
+/* Determines up to 2 candidate outward directions to hold during the
+ * CROSSING phase for exit tile (ex,ey), writing them into out[0..return
+ * value-1]. Ordering: the direction the BFS path actually arrived from is
+ * tried first if it satisfies walk_dir_qualifies() -- continuing the same
+ * way keeps walking straight through the doorway, since the corridor
+ * leading to a door is, in every room layout this engine presents,
+ * aligned with the door's own crossing axis. Remaining qualifying
+ * directions (the brief's off-grid-or-non-walkable-neighbor test) fill
+ * the rest, up to 2 total, in a fixed scan order. Falls back to the
+ * arrival direction (or DOWN if there wasn't one, e.g. a zero-length
+ * path) if nothing qualifies, rather than returning an empty list.
+ *
+ * IMPLEMENTER NOTE (per the brief -- study check_footprint first, prefer
+ * engine geometry if it's cheap and fair): considered reusing the
+ * engine's own exit_dx[] (game.c, get_tile_props/check_footprint,
+ * ~game.c:2112-2260) for this instead. Not used: exit_dx is a
+ * footprint-quadrant selector computed relative to one specific attempted
+ * (dx,d2y) motion, mid-way through check_footprint's own 4-mask collision
+ * scan -- not a standalone "which way does this door face" value. Reusing
+ * it here would mean replicating check_footprint's whole mask-offset
+ * machinery, right next to the exit_flags lock/grade reads fair play
+ * forbids touching at all, just to recover information the walkable-floor
+ * snapshot already gives us directly. The walkable-neighbor test below is
+ * pure geometry (the same snapshot /room and the BFS already use) and no
+ * more expensive than up to 4 array lookups. */
+static int walk_exit_dir_candidates(int16_t ex, int16_t ey, walk_dir_t* out)
+{
+    static const walk_dir_t all_dirs[4] = {
+        WALK_DIR_RIGHT, WALK_DIR_LEFT, WALK_DIR_DOWN, WALK_DIR_UP
+    };
+    int n = 0, i;
+    bool have_arrival = false;
+    walk_dir_t arrival = WALK_DIR_DOWN;
+
+    if (walk_path_len >= 1) {
+        int16_t fx, fy, tx, ty;
+        if (walk_path_len >= 2) {
+            fx = walk_path_x[walk_path_len - 2];
+            fy = walk_path_y[walk_path_len - 2];
+        } else {
+            fx = walk_start_x;
+            fy = walk_start_y;
+        }
+        tx = walk_path_x[walk_path_len - 1];
+        ty = walk_path_y[walk_path_len - 1];
+        if      (tx - fx ==  1) { arrival = WALK_DIR_RIGHT; have_arrival = true; }
+        else if (tx - fx == -1) { arrival = WALK_DIR_LEFT;  have_arrival = true; }
+        else if (ty - fy ==  1) { arrival = WALK_DIR_DOWN;  have_arrival = true; }
+        else if (ty - fy == -1) { arrival = WALK_DIR_UP;    have_arrival = true; }
+    }
+
+    if (have_arrival && walk_dir_qualifies(ex, ey, arrival))
+        out[n++] = arrival;
+
+    for (i = 0; i < 4 && n < 2; i++) {
+        if (n > 0 && all_dirs[i] == out[0]) continue;
+        if (walk_dir_qualifies(ex, ey, all_dirs[i]))
+            out[n++] = all_dirs[i];
+    }
+
+    if (n == 0)
+        out[n++] = have_arrival ? arrival : WALK_DIR_DOWN;
+
+    return n;
+}
+
+/* CROSSING phase (part A): pins the outward key for candidate direction
+ * walk_cross_cand[idx] (held unconditionally -- never deadbanded, since
+ * the whole point is to keep leaving) while deadband-correcting the
+ * PERPENDICULAR axis toward the exit tile's center every tick, exactly
+ * the way PATH-phase steering corrects both axes at once ("diagonals
+ * allowed as in walk_pump", per the brief). This matters: a prisoner who
+ * reached the exit tile slightly off-center on the cross axis, then had
+ * only the outward key held with no correction, would keep pushing along
+ * a line that never actually satisfies the doorway's collision mask and
+ * stall forever even though the door itself is open -- caught live during
+ * this task's own verification pass (every non-edge door in room 253
+ * reported `blocked` until this fix; edge-of-map doors happened to work
+ * anyway because they need no perpendicular alignment beyond what the
+ * BFS's own tile-center-seeking PATH phase already provided on arrival).
+ * On a leg timeout, advances to the next candidate (wrapping ends a
+ * round); after WALK_CROSS_MAX_ROUNDS rounds with no room change, gives
+ * up. Success (room changed) is detected by walk_pump's shared preamble,
+ * not here. */
+static void walk_pump_cross(void)
+{
+    int16_t px, p2y, cx, cy;
+    walk_dir_t d;
+
+    walk_cross_ticks++;
+    if (walk_cross_ticks >= WALK_CROSS_LEG_TICKS) {
+        walk_cross_ticks = 0;
+        walk_cross_idx++;
+        if (walk_cross_idx >= walk_cross_ncand) {
+            walk_cross_idx = 0;
+            walk_cross_round++;
+            if (walk_cross_round >= WALK_CROSS_MAX_ROUNDS) {
+                walk_cancel(WALK_BLOCKED);
+                return;
+            }
+        }
+    }
+
+    d   = walk_cross_cand[walk_cross_idx];
+    px  = guybrush[current_nation].px;
+    p2y = guybrush[current_nation].p2y;
+    cx  = (int16_t)(walk_target_x * 32 + 16);
+    cy  = (int16_t)(walk_target_y * 32 + 16);
+
+    /* Pin the primary (outward) axis. */
+    if (d == WALK_DIR_LEFT) {
+        key_down[walk_key_left] = true;
+        key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+    } else if (d == WALK_DIR_RIGHT) {
+        key_down[walk_key_right] = true;
+        key_down[walk_key_left] = false; key_readonce[walk_key_left] = false;
+    } else if (d == WALK_DIR_UP) {
+        key_down[walk_key_up] = true;
+        key_down[walk_key_down] = false; key_readonce[walk_key_down] = false;
+    } else {
+        key_down[walk_key_down] = true;
+        key_down[walk_key_up] = false; key_readonce[walk_key_up] = false;
+    }
+
+    /* Deadband-correct the perpendicular axis toward the exit tile's
+     * center (same test PATH-phase steering uses). */
+    if (d == WALK_DIR_LEFT || d == WALK_DIR_RIGHT) {
+        if (p2y < cy - WALK_DEADBAND) {
+            key_down[walk_key_down] = true;
+            key_down[walk_key_up] = false; key_readonce[walk_key_up] = false;
+        } else if (p2y > cy + WALK_DEADBAND) {
+            key_down[walk_key_up] = true;
+            key_down[walk_key_down] = false; key_readonce[walk_key_down] = false;
+        } else {
+            key_down[walk_key_up] = false; key_readonce[walk_key_up] = false;
+            key_down[walk_key_down] = false; key_readonce[walk_key_down] = false;
+        }
+    } else {
+        if (px < cx - WALK_DEADBAND) {
+            key_down[walk_key_right] = true;
+            key_down[walk_key_left] = false; key_readonce[walk_key_left] = false;
+        } else if (px > cx + WALK_DEADBAND) {
+            key_down[walk_key_left] = true;
+            key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+        } else {
+            key_down[walk_key_left] = false; key_readonce[walk_key_left] = false;
+            key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+        }
+    }
+}
+
+/* SIDESTEP (recovery, part B) phase: hold one perpendicular side, then
+ * the other, each for WALK_SIDESTEP_LEG_TICKS ticks; once both are tried,
+ * release and re-BFS from wherever that left the prisoner to the walk's
+ * ORIGINAL target (walk_target_x/y, not whatever waypoint we'd been
+ * chasing) on a FRESH grid snapshot, then resume WALK_PHASE_PATH. Blocked
+ * if the fresh snapshot or the re-BFS fails (e.g. the sidestep itself ran
+ * into a wall and made no progress). */
+static void walk_pump_sidestep(void)
+{
+    uint16_t width = 0, height = 0;
+    int16_t sx, sy;
+    int new_len = 0, snap;
+
+    if (++walk_sidestep_ticks < WALK_SIDESTEP_LEG_TICKS)
+        return;
+
+    walk_sidestep_idx++;
+    if (walk_sidestep_idx < 2) {
+        walk_sidestep_ticks = 0;
+        walk_hold_only(walk_dir_key(walk_sidestep_dir[walk_sidestep_idx]));
+        return;
+    }
+
+    walk_release_keys();
+    snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
+    if (snap != WALK_SNAP_OK) { walk_cancel(WALK_BLOCKED); return; }
+    walk_width = width;
+    walk_height = height;
+
+    sx = guybrush[current_nation].px / 32;
+    sy = guybrush[current_nation].p2y / 32;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx >= (int16_t)width)  sx = (int16_t)width  - 1;
+    if (sy >= (int16_t)height) sy = (int16_t)height - 1;
+
+    if (walk_target_x < 0 || walk_target_y < 0 ||
+        walk_target_x >= (int16_t)width || walk_target_y >= (int16_t)height ||
+        !walk_bfs(width, height, sx, sy, walk_target_x, walk_target_y, &new_len)) {
+        walk_cancel(WALK_BLOCKED);
+        return;
+    }
+
+    walk_path_len = new_len;
+    walk_path_idx = 0;
+    walk_stall_ticks = 0;
+    walk_stall_px = guybrush[current_nation].px;
+    walk_stall_p2y = guybrush[current_nation].p2y;
+    walk_phase = WALK_PHASE_PATH;
+}
+
 /* Called every tick from agent_api_tick(), right after input_pump() (see
  * its call site) so a walk drives direction keys on the same cadence a
- * real held key would. Holds key_down[KEY_DIRECTION_*] toward the current
- * waypoint's tile center; two direction keys held together give the
- * engine's own diagonal motion (main.c:915-923) for free. */
+ * real held key would. WALK_PHASE_PATH holds key_down[KEY_DIRECTION_*]
+ * toward the current waypoint's tile center; two direction keys held
+ * together give the engine's own diagonal motion (main.c:915-923) for
+ * free. WALK_PHASE_CROSS and WALK_PHASE_SIDESTEP (Task 9) hold a single
+ * direction key at a time -- see their own header comments above. */
 static void walk_pump(void)
 {
     int16_t px, p2y, tile_x, tile_y, target_x, target_y, cx, cy;
@@ -878,24 +1310,62 @@ static void walk_pump(void)
      * blocked, per the brief. */
     if (current_nation != walk_nation) { walk_cancel(WALK_BLOCKED); return; }
 
-    /* Room change (arrived through the target exit, or any other cause)
-     * is success, not failure -- the walk got the prisoner out of the
-     * room, which is what "arrived" means for an exit-tile target. */
+    /* Whole-walk hard cap (part B): bounds path-following + one
+     * sidestep-recovery attempt + crossing all taking their maximum time
+     * in sequence, protecting against any pathological loop. */
+    if (++walk_total_ticks > WALK_MAX_TICKS) { walk_cancel(WALK_BLOCKED); return; }
+
+    /* Room change is success on every phase -- the walk got the prisoner
+     * out of the room. This doubles as the CROSSING phase's actual
+     * success signal (see its header comment): reaching it there needs no
+     * phase-specific check of its own. */
     if (guybrush[current_nation].room != walk_room) { walk_cancel(WALK_ARRIVED); return; }
 
+    if (walk_phase == WALK_PHASE_CROSS)    { walk_pump_cross();    return; }
+    if (walk_phase == WALK_PHASE_SIDESTEP) { walk_pump_sidestep(); return; }
+
+    /* WALK_PHASE_PATH: follow the BFS path (Task 8 behavior), plus the
+     * stall -> one-shot sidestep-recovery hook (part B) and the
+     * target-reached -> CROSSING-phase handoff (part A). */
     px  = guybrush[current_nation].px;
     p2y = guybrush[current_nation].p2y;
+    tile_x = px / 32;
+    tile_y = p2y / 32;
 
     if (px == walk_stall_px && p2y == walk_stall_p2y) {
-        if (++walk_stall_ticks >= WALK_STALL_LIMIT) { walk_cancel(WALK_BLOCKED); return; }
+        if (++walk_stall_ticks >= WALK_STALL_LIMIT) {
+            if (!walk_recovered && walk_path_idx < walk_path_len - 1) {
+                /* Non-final-waypoint stall, recovery not used yet:
+                 * sidestep perpendicular to the current leg's direction
+                 * of travel. Each BFS step is single-axis (walk_bfs is
+                 * 4-connected), so comparing the waypoint we were heading
+                 * for against our current tile unambiguously tells us
+                 * which axis was "primary" (blocked) and which is
+                 * perpendicular (the way around). */
+                int16_t wtx = walk_path_x[walk_path_idx];
+                walk_recovered = true;
+                walk_phase = WALK_PHASE_SIDESTEP;
+                if (wtx != tile_x) {
+                    walk_sidestep_dir[0] = WALK_DIR_DOWN;
+                    walk_sidestep_dir[1] = WALK_DIR_UP;
+                } else {
+                    walk_sidestep_dir[0] = WALK_DIR_RIGHT;
+                    walk_sidestep_dir[1] = WALK_DIR_LEFT;
+                }
+                walk_sidestep_idx = 0;
+                walk_sidestep_ticks = 0;
+                walk_hold_only(walk_dir_key(walk_sidestep_dir[0]));
+                walk_stall_ticks = 0;
+                return;
+            }
+            walk_cancel(WALK_BLOCKED);
+            return;
+        }
     } else {
         walk_stall_ticks = 0;
         walk_stall_px = px;
         walk_stall_p2y = p2y;
     }
-
-    tile_x = px / 32;
-    tile_y = p2y / 32;
 
     /* Advance past any waypoints already reached (normally just one tile
      * per tick, but a single tick could in principle cross more than one
@@ -905,7 +1375,26 @@ static void walk_pump(void)
            tile_y == walk_path_y[walk_path_idx])
         walk_path_idx++;
 
-    if (walk_path_idx >= walk_path_len) { walk_cancel(WALK_ARRIVED); return; }
+    if (walk_path_idx >= walk_path_len) {
+        if (walk_is_exit_target) {
+            /* Target reached on an exit walk: don't call it arrived yet
+             * -- hand off to the CROSSING phase to actually push through
+             * the doorway (part A). */
+            walk_phase = WALK_PHASE_CROSS;
+            walk_cross_ncand = walk_exit_dir_candidates(walk_target_x, walk_target_y,
+                                                         walk_cross_cand);
+            walk_cross_idx = 0;
+            walk_cross_round = 0;
+            walk_cross_ticks = 0;
+            /* Set this tick's keys immediately (rather than waiting for
+             * the next tick) so no tick is spent still holding whatever
+             * PATH-phase was steering with a moment ago. */
+            walk_pump_cross();
+            return;
+        }
+        walk_cancel(WALK_ARRIVED);
+        return;
+    }
 
     target_x = walk_path_x[walk_path_idx];
     target_y = walk_path_y[walk_path_idx];
@@ -947,6 +1436,7 @@ static void handle_walk(int cfd, const char* body)
     uint16_t width = 0, height = 0;
     int16_t sx, sy, tx = 0, ty = 0;
     int snap, path_len = 0;
+    bool is_exit_target;
     char resp[80]; int n;
 
     if (body) {
@@ -1002,6 +1492,13 @@ static void handle_walk(int cfd, const char* body)
         return;
     }
 
+    /* Part A: an explicit {"exit":N} request is always an exit walk; a
+     * {"tile":[x,y]} request is one too if it happens to land on an exit
+     * cell (walk_grid_isexit[], populated by the same scan that just
+     * built walk_grid_walkable[] above) -- gates the target-reached ->
+     * CROSSING-phase handoff in walk_pump. */
+    is_exit_target = (exit_idx >= 0) || walk_grid_isexit[(int)ty*(int)width + tx];
+
     sx = guybrush[current_nation].px / 32;
     sy = guybrush[current_nation].p2y / 32;
     if (sx < 0) sx = 0;
@@ -1031,6 +1528,20 @@ static void handle_walk(int cfd, const char* body)
     walk_key_down  = KEY_DIRECTION_DOWN;
     walk_key_left  = KEY_DIRECTION_LEFT;
     walk_key_right = KEY_DIRECTION_RIGHT;
+    /* Task 9 state: fresh snapshot dimensions/target/start for the
+     * CROSSING-direction heuristic and any sidestep-recovery re-path,
+     * phase reset to PATH, the one-shot recovery latch cleared, and the
+     * whole-walk tick budget restarted. */
+    walk_width = width;
+    walk_height = height;
+    walk_target_x = tx;
+    walk_target_y = ty;
+    walk_start_x = sx;
+    walk_start_y = sy;
+    walk_is_exit_target = is_exit_target;
+    walk_phase = WALK_PHASE_PATH;
+    walk_recovered = false;
+    walk_total_ticks = 0;
     walk_status = WALK_WALKING;
 
     n = snprintf(resp, sizeof(resp),
