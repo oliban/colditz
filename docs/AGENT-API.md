@@ -196,21 +196,26 @@ curl -s -X POST -d '{"cancel":true}' localhost:8765/walk  # => {"walking":false}
   tied to one specific attempted motion, not a portable door-orientation
   value, and reusing it would mean touching the adjacent lock/grade reads
   fair play forbids.)
-- **Stall auto-recovery (Task 9).** If the walk stalls (see below) while
-  still en route to a non-final waypoint, and this walk hasn't already
-  used its one recovery attempt, `/walk` tries to route around the
-  obstruction automatically: sidestep perpendicular to the blocked leg's
-  direction of travel (~0.4s each side), then re-run the BFS from wherever
-  that leaves the prisoner to the walk's original target on a **fresh**
-  floor snapshot, and resume. Only one recovery per walk — a second stall,
-  or any stall on the final waypoint itself, is `blocked` immediately, as
-  before Task 9.
+- **Stall auto-recovery (Task 9; budget raised in the gauntlet stabilization
+  pass).** If the walk stalls (see below) while still en route to a
+  non-final waypoint, and this walk hasn't already exhausted its recovery
+  budget, `/walk` tries to route around the obstruction automatically:
+  sidestep perpendicular to the blocked leg's direction of travel (~0.4s
+  each side), then re-run the BFS from wherever that leaves the prisoner to
+  the walk's original target on a **fresh** floor snapshot, and resume. Up
+  to `WALK_MAX_RECOVERIES` (2) recoveries per walk — originally a single
+  one-shot attempt, raised after a live-diagnosed case (room 227's exit
+  walk to tile `[3,5]`) genuinely needed two in sequence to get through,
+  each making real incremental progress (confirmed no guard was ever
+  present at either stall). A stall once the budget is exhausted, or any
+  stall on the final waypoint itself, is `blocked` immediately, as before
+  Task 9.
 - Ends `blocked` if the prisoner's pixel position hasn't moved for 40
   consecutive ticks (~0.65s at the ~16ms tick rate) while direction keys
   are held — covers a locked door, blocking furniture, or a guard body
   block, all indistinguishable from each other at this level (same as what
-  a human bumping into any of them experiences) — subject to the one
-  stall-recovery attempt above.
+  a human bumping into any of them experiences) — subject to the
+  stall-recovery budget above.
 - Ends `blocked` (not `arrived`) if the current prisoner changes mid-walk
   (`prisoner_N` key, or any other cause) — the walk's whole premise (path
   computed for a specific prisoner's position) no longer holds.
@@ -293,9 +298,10 @@ curl -s -X POST -d '{"item":"lockpick","pickup":true}' localhost:8765/walk
   was verified live to just slide back and forth without ever making
   progress on the corner case; a simultaneous two-key diagonal hold was
   also tried and verified live to be rejected by this engine's collision
-  test even when the sequential shift-then-push is accepted. One recovery
-  attempt per walk (the same `walk_recovered` latch every other phase
-  shares); a further stall after that is `blocked`.
+  test even when the sequential shift-then-push is accepted. Shares the
+  same bounded recovery budget every other phase uses (`walk_recovery_count`
+  / `WALK_MAX_RECOVERIES`, 2); a stall once that budget is exhausted is
+  `blocked`.
 - All the ordinary `/walk` termination rules still apply unchanged: prisoner
   switch or room change mid-walk ends it, the whole-walk 30s cap still
   applies across pathing + recovery + pixel-steering combined, `/input`

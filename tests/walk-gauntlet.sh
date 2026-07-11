@@ -18,6 +18,17 @@
 #      discovered live, since campaign/map.md had no tile data for
 #      219/224/227 at the time this script was written; see the Task 10
 #      report for how they were found)
+#
+# Retries: the three locked-door legs ("253 locked door [5,3]/[6,3]/[5,5]")
+# each get ONE script-level retry (leg_walk_blocked_door's third arg) --
+# live diagnostic logging confirmed a real patrolling guard is sometimes
+# standing in that same checkpoint corridor when the leg runs, which
+# walk_classify_stall() correctly reports as "guard" (it saw a real guard)
+# rather than "door" (it can't inspect lock state -- fair play). This is
+# guard-patrol timing, not a walker defect -- see leg_walk_blocked_door's
+# own header comment for the full diagnosis. No other leg retries: the
+# 227->230 French-descent leg that used to need this was root-caused and
+# fixed in the walker itself (WALK_MAX_RECOVERIES, agent_api.c) instead.
 set -u
 cd "$(dirname "$0")/.."
 GAMEDIR="../Colditz Escape"
@@ -90,28 +101,56 @@ leg_walk_arrive() {
 # Issues one /walk request and requires it to end blocked with reason
 # "door" (a locked door -- fair-play discovery, same as a human bumping
 # into a closed door).
+#
+# Room 253's checkpoint corridor (leading to the [5,3]/[6,3]/[5,5] locked
+# doors) is also where the guards' own patrol route runs -- confirmed live
+# via temporary diagnostic logging in walk_classify_stall() (since removed):
+# a real guybrush guard was measured 9px from the prisoner, well inside
+# WALK_BLOCKED_GUARD_RADIUS, when a locked-door walk stalled. Because the
+# patrol is moving, not posted, whether it happens to be in that corridor
+# at the exact moment a given gauntlet run reaches this leg varies run to
+# run -- the walk_classify_stall() disambiguation (door-adjacency checked
+# first, guard checked second) is working as designed; it just can't tell
+# "guard is standing on the door" from "guard is in the corridor between me
+# and the door" and, correctly, prefers to report the guard it can actually
+# see over the door it can't inspect (fair play: no lock-state reads).
+# This is a genuine guard-timing flake, not a walker defect, so this
+# specific leg gets one retry (brief-sanctioned: "guard-timing flakes
+# should be handled by the script retrying that leg once").
 leg_walk_blocked_door() {
-  local name="$1" body="$2"
-  local t0 t1 dt code resp status reason
-  drain_queue
+  local name="$1" body="$2" retry="${3:-0}"
+  local attempt=1 t0 t1 dt code resp status reason
   t0=$(date +%s.%N)
-  resp=$(curl -s -o /tmp/gauntlet_walk.json -w '%{http_code}' -X POST -d "$body" "http://127.0.0.1:$PORT/walk")
-  code="$resp"
-  if [ "$code" != "202" ]; then
+  while :; do
+    drain_queue
+    resp=$(curl -s -o /tmp/gauntlet_walk.json -w '%{http_code}' -X POST -d "$body" "http://127.0.0.1:$PORT/walk")
+    code="$resp"
+    if [ "$code" != "202" ]; then
+      status="rejected($code)"; reason=""
+    else
+      status=$(wait_walk)
+      reason=$(blocked_reason)
+    fi
+    if [ "$status" = "blocked" ] && [ "$reason" = "\"door\"" -o "$reason" = "door" ]; then
+      t1=$(date +%s.%N); dt=$(echo "$t1 - $t0" | bc)
+      leg_pass "$name" "blocked (door)$( [ $attempt -gt 1 ] && echo ", after retry")" "$dt"
+      return 0
+    fi
+    if [ "$retry" = "1" ] && [ $attempt -eq 1 ]; then
+      say "RETRY: $name first attempt gave status=$status reason=$reason (guard-timing-flaky leg, see comment above) -- waiting for the patrol to clear, then retrying once"
+      # A brief deliberate pause (not just an immediate re-POST) before the
+      # one retry: the guard causing this is patrolling, not posted, so
+      # giving it a few real seconds to walk on measurably improves the
+      # retry's odds versus re-issuing instantly into the same patrol
+      # position the first attempt just measured.
+      sleep 4
+      attempt=2
+      continue
+    fi
     t1=$(date +%s.%N); dt=$(echo "$t1 - $t0" | bc)
-    leg_fail "$name" "walk rejected ($code: $(cat /tmp/gauntlet_walk.json))" "$dt"
-    return 1
-  fi
-  status=$(wait_walk)
-  reason=$(blocked_reason)
-  t1=$(date +%s.%N); dt=$(echo "$t1 - $t0" | bc)
-  if [ "$status" = "blocked" ] && [ "$reason" = "\"door\"" -o "$reason" = "door" ]; then
-    leg_pass "$name" "blocked (door)" "$dt"
-    return 0
-  else
     leg_fail "$name" "status=$status reason=$reason (expected blocked/door)" "$dt"
     return 1
-  fi
+  done
 }
 
 # --- Setup ---------------------------------------------------------
@@ -168,9 +207,9 @@ leg_walk_arrive "253 exit [1,7]->254 (via [0,7])" '{"exit":5}' "254"
 leg_walk_arrive "254 exit back->253"  '{"exit":0}' "253"
 leg_walk_arrive "253 exit [3,7]->255" '{"tile":[3,7]}' "255"
 leg_walk_arrive "255 exit back->253"  '{"exit":0}' "253"
-leg_walk_blocked_door "253 locked door [5,3]" '{"exit":0}'
-leg_walk_blocked_door "253 locked door [6,3]" '{"exit":1}'
-leg_walk_blocked_door "253 locked door [5,5]" '{"exit":4}'
+leg_walk_blocked_door "253 locked door [5,3]" '{"exit":0}' 1
+leg_walk_blocked_door "253 locked door [6,3]" '{"exit":1}' 1
+leg_walk_blocked_door "253 locked door [5,5]" '{"exit":4}' 1
 
 echo "=== Leg 4: French descent 219 -> 224 -> 227 -> 230 -> 231 ==="
 drain_queue

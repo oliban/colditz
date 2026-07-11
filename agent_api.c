@@ -964,8 +964,11 @@ static int walk_item_progress_ticks = 0;
  * A was the right side but round 1's 12px undershot the corner).
  * Exhausting WALK_ITEM_ROUND_MAX rounds falls through to the SAME
  * generic sidestep-then-re-BFS recovery plain-tile PATH-phase stalls use
- * (walk_recovered, shared, one shot per whole walk) -- brief, verbatim:
- * "then the existing one-shot re-path recovery -> then blocked". The
+ * (walk_recovery_count, shared, capped at WALK_MAX_RECOVERIES per whole
+ * walk -- see that constant's own comment for why it's 2, not the brief's
+ * original 1) -- brief, verbatim: "then the existing one-shot re-path
+ * recovery -> then blocked" (now a small bounded number of attempts
+ * rather than exactly one; see WALK_MAX_RECOVERIES). The
  * primary axis for a whole round is captured once at the round's start
  * (walk_item_round_primary_is_x) rather than recomputed every tick, so a
  * momentary axis flip mid-round (brief: "temporary leaving of an in-range
@@ -1043,14 +1046,15 @@ static int walk_stall_ticks = 0;
  *    reached. Holds an "outward" direction key (see
  *    walk_exit_dir_candidates below) until the room changes (arrived) or
  *    the crossing attempt's time budget runs out (blocked).
- *  - WALK_PHASE_SIDESTEP: entered on the walk's first stall while still
- *    en route to a non-final waypoint. Nudges perpendicular to the
- *    current leg's direction of travel for a bounded time, then re-BFS's
- *    from wherever that left the prisoner to the ORIGINAL target on a
- *    fresh grid snapshot, and resumes WALK_PHASE_PATH. One recovery per
- *    walk (walk_recovered latches after the first attempt); a second
- *    stall (or a stall on the final waypoint) is blocked immediately, as
- *    before Task 9.
+ *  - WALK_PHASE_SIDESTEP: entered on a stall while still en route to a
+ *    non-final waypoint. Nudges perpendicular to the current leg's
+ *    direction of travel for a bounded time, then re-BFS's from wherever
+ *    that left the prisoner to the ORIGINAL target on a fresh grid
+ *    snapshot, and resumes WALK_PHASE_PATH. A small bounded number of
+ *    recoveries per walk (WALK_MAX_RECOVERIES, walk_recovery_count counts
+ *    attempts used -- see that constant's own comment); a stall once the
+ *    budget is exhausted (or a stall on the final waypoint) is blocked
+ *    immediately, as before Task 9.
  *
  * All three phases terminate exclusively through walk_cancel() (called
  * from walk_pump's shared per-tick preamble below), so the single
@@ -1063,7 +1067,7 @@ static int walk_stall_ticks = 0;
  * through walk_cancel() too. Its own stall recovery is a dedicated bounded
  * corner-rounding sequence (see walk_pump_item_round's header comment);
  * only once THAT is exhausted does it fall through to WALK_PHASE_SIDESTEP
- * itself, reusing the exact same one-shot walk_recovered-gated
+ * itself, reusing the exact same walk_recovery_count-gated
  * sidestep-then-re-BFS plain-tile stalls use -- on that path's re-BFS
  * completing, PATH-phase's own target-reached check routes back into
  * ITEM_PIXEL. */
@@ -1073,8 +1077,28 @@ typedef enum {
 } walk_phase_t;
 static walk_phase_t walk_phase = WALK_PHASE_PATH;
 
-/* One recovery attempt per walk (part B); reset in handle_walk. */
-static bool walk_recovered = false;
+/* Recovery-attempt budget per whole walk (part B); reset in handle_walk.
+ * Originally a one-shot bool ("one recovery attempt per walk," per the
+ * brief). Root-caused during the gauntlet stabilization pass: room 227's
+ * 227->230 exit walk (target tile [3,5]) is a genuine two-recovery case --
+ * live diagnostic logging (fprintf at both the stall-limit-hit and
+ * sidestep_finish call sites, since removed) showed the SAME walk needing
+ * sidestep-then-re-BFS recovery TWICE in sequence (first near tile (2,5)/
+ * (1,3), then again near (2,4)) before the remaining leg to (3,5) was a
+ * single straight, un-stalled run -- with the budget capped at 1, the
+ * second stall had no recovery left and gave up with blocked_reason
+ * "static" even though the walk was making genuine incremental progress
+ * each time (not oscillating -- confirmed no other guybrush was ever in
+ * the room at either stall, ruling out a guard encounter). A single retried
+ * /walk from the same failure point succeeded immediately every time,
+ * because a *fresh* walk resets this budget -- i.e. the walk fundamentally
+ * only needed a bigger budget, not different logic. Raised to 2 (still a
+ * small, bounded cap, not "unbounded retries") -- since this can only let
+ * a walk that would previously have given up try harder, it cannot regress
+ * any walk that only ever needed 0 or 1 recovery (room 251's lockpick,
+ * room 253's [1,7]/[3,7] doorways, etc. -- all reverified unaffected). */
+#define WALK_MAX_RECOVERIES 2
+static int walk_recovery_count = 0;
 
 /* Whole-walk (all phases combined) hard cap: 30s / 16ms/tick. Protects
  * against any pathological loop across path-following, sidestep-recovery,
@@ -2151,8 +2175,8 @@ static bool walk_item_try_next_side(void)
  * (walk_item_try_next_side above); only when every side has been tried,
  * fall back to the generic sidestep-then-re-BFS recovery plain-tile
  * PATH-phase stalls use (WALK_PHASE_SIDESTEP, gated by the shared
- * walk_recovered one-shot latch); a further stall after that is blocked
- * immediately. */
+ * walk_recovery_count budget); a stall once that budget is exhausted is
+ * blocked immediately. */
 static void walk_item_round_exhausted(int16_t px, int16_t p2y, bool primary_is_x)
 {
     walk_item_rounding = false;
@@ -2160,7 +2184,7 @@ static void walk_item_round_exhausted(int16_t px, int16_t p2y, bool primary_is_x
         walk_release_keys();
         return;
     }
-    if (!walk_recovered) {
+    if (walk_recovery_count < WALK_MAX_RECOVERIES) {
         /* walk_target_x/y is still the item's (unreached) tile target at
          * this point -- walk_item_try_next_side above already failed to
          * find a next side, so it never reassigned them. Derive the
@@ -2169,7 +2193,7 @@ static void walk_item_round_exhausted(int16_t px, int16_t p2y, bool primary_is_x
          * SIDESTEP entry does, from that target tile's center. */
         int16_t wcx = (int16_t)(walk_target_x * 32 + 16);
         int16_t wcy = (int16_t)(walk_target_y * 32 + 16);
-        walk_recovered = true;
+        walk_recovery_count++;
         walk_phase = WALK_PHASE_SIDESTEP;
         if (primary_is_x) {
             walk_sidestep_dir[0] = WALK_DIR_DOWN;
@@ -2417,8 +2441,8 @@ static void walk_pump(void)
                 walk_pump_item_pixel();
                 return;
             }
-            if (!walk_recovered && walk_path_idx < walk_path_len - 1) {
-                /* Non-final-waypoint stall, recovery not used yet:
+            if (walk_recovery_count < WALK_MAX_RECOVERIES && walk_path_idx < walk_path_len - 1) {
+                /* Non-final-waypoint stall, recovery budget not exhausted:
                  * sidestep perpendicular to the current leg's direction
                  * of travel. Each BFS step (in the tile path
                  * walk_path_to_tiles derives from the subcell search) is
@@ -2430,7 +2454,7 @@ static void walk_pump(void)
                 int16_t wty = walk_path_y[walk_path_idx];
                 int16_t wcx = (int16_t)(wtx * 32 + 16);
                 int16_t wcy = (int16_t)(wty * 32 + 16);
-                walk_recovered = true;
+                walk_recovery_count++;
                 walk_phase = WALK_PHASE_SIDESTEP;
                 if (wtx != tile_x) {
                     walk_sidestep_dir[0] = WALK_DIR_DOWN;
@@ -2886,7 +2910,7 @@ static void handle_walk(int cfd, const char* body)
     walk_item_rounding = false;
     walk_item_round_sidestepping = false;
     walk_phase = WALK_PHASE_PATH;
-    walk_recovered = false;
+    walk_recovery_count = 0;
     walk_total_ticks = 0;
     walk_blocked_reason = WALK_BLOCK_NONE;
     walk_status = WALK_WALKING;
@@ -2966,6 +2990,25 @@ void agent_api_tick(void)
     for (accepted = 0; accepted < AGENT_API_MAX_ACCEPTS_PER_TICK; accepted++) {
         cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) return;
+        /* Root cause of the intermittent-empty-response flakiness under
+         * rapid repeated requests (proved with an isolated repro, not
+         * guessed): on this platform (macOS/BSD sockets), a socket
+         * returned by accept() INHERITS the O_NONBLOCK flag of the
+         * listening socket (listen_fd is deliberately non-blocking so the
+         * accept loop above never stalls waiting for a new connection).
+         * SO_RCVTIMEO/SO_SNDTIMEO only bound how long a *blocking* call
+         * waits -- they are silently no-ops on a non-blocking socket, where
+         * recv() instead returns -1/EAGAIN immediately if the client's
+         * request bytes haven't arrived yet (a real race: accept() can
+         * complete as soon as the TCP handshake finishes, which can win
+         * against the client's own write() under load/rapid-fire connects).
+         * handle_request()'s `if (n <= 0) return;` then silently closes the
+         * connection with zero bytes written -- the client sees an empty
+         * reply. Clearing O_NONBLOCK here makes cfd a genuinely blocking
+         * socket, so SO_RCVTIMEO/SO_SNDTIMEO (set right after) do what
+         * their names say: recv() blocks (up to 200ms) until the request
+         * actually arrives instead of failing on an accept/write race. */
+        fcntl(cfd, F_SETFL, fcntl(cfd, F_GETFL) & ~O_NONBLOCK);
         setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         handle_request(cfd);
