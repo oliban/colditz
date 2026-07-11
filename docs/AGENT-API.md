@@ -144,6 +144,19 @@ curl -s -X POST -d '{"cancel":true}' localhost:8765/walk  # => {"walking":false}
   for free). No malloc — the grid, BFS working arrays, and path are all
   bounded static buffers sized for the largest room the engine ever serves
   (the 84x72 outside map).
+- **Mask-accurate reachability (Task 10).** Underneath that tile-level
+  waypoint list, reachability is actually resolved on a finer 4x4-unit
+  subcell grid sampled against the engine's own collision masks (mirroring
+  `check_footprint`'s bit-sampling math, static geometry only — see the
+  Task 10 report for the design writeup), so a tile that's only *partially*
+  covered by furniture (readable as walkable by the coarse "any nonzero
+  tile id" test alone) is routed around/through correctly instead of
+  blindly targeted and then recovered from. The BFS still hands
+  `WALK_PHASE_PATH` a **tile**-resolution waypoint list, though — driving
+  steering at the full subcell resolution was tried and found to make the
+  existing recovery machinery (tuned for tile-scale stalls) unreliable in
+  tight/diagonal room geometry; see the report for the concrete case and
+  self-review.
 - `path_len` in the 202 response is the number of waypoint tiles the BFS
   found (informational only — no field of `/walk`'s response is meant for
   precise dead-reckoning; poll `/state`'s `walk` field for progress).
@@ -214,6 +227,26 @@ curl -s -X POST -d '{"cancel":true}' localhost:8765/walk  # => {"walking":false}
 - `/state` gains a `walk` field: `"idle"` (never walked, or cancelled),
   `"walking"`, `"arrived"`, or `"blocked"` — the last-completed status
   persists until the next `/walk` or a manual `/input` cancels it.
+- **`walk_blocked_reason` (Task 10).** `/state` always includes this field:
+  `null` whenever `walk` isn't `"blocked"`, otherwise one of `"guard"`,
+  `"door"`, `"static"`, or `"timeout"` explaining WHY the walk stopped:
+  - `"guard"` — another guybrush (any prisoner or guard other than the
+    current one) is in the same room, within ~24 units on both axes of
+    the stall point. Same fair-play tier as everything else `/walk` and
+    `/state` expose: on-screen-visible character positions, nothing else.
+  - `"door"` — the stall happened during the doorway-crossing (CROSSING)
+    phase, or with the prisoner at/adjacent to the exit tile — most often
+    a locked door (fair-play: `/walk` never reads lock/grade state, so
+    this is discovered by trying, exactly like a human bumping into a
+    closed door).
+  - `"static"` — the fallback: mask/geometry blocked progress and neither
+    of the above applied.
+  - `"timeout"` — the walk's own 30-second whole-walk cap elapsed.
+  See `docs/agent-play/` route notes for known locked doors vs. genuinely
+  open-but-awkward doorways discovered during Task 10's own verification
+  pass — a few doorways need a specific approach tile (not just the exit
+  index) to cross reliably; `/walk`'s own recovery machinery does not yet
+  fully compensate for every such case (see the Task 10 report).
 
 ### `/walk` item mode — pixel-precision pickup
 

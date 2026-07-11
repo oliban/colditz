@@ -243,6 +243,33 @@ static const char* walk_status_name(walk_status_t s)
     }
 }
 
+/* Task 10 part B: WHY a walk ended blocked. Set alongside every
+ * walk_cancel(WALK_BLOCKED) call site (via walk_set_blocked() below,
+ * defined once the walk machinery's other state -- current_nation,
+ * guybrush[], walk_is_exit_target/walk_target_x/y -- is in scope) so
+ * /state's "walk_blocked_reason" field always reflects the actual cause of
+ * the most recent blocked result, not just the fact that it happened.
+ * Reset to NONE (serialized as JSON null) at the start of every fresh
+ * /walk; /state only ever reports a non-null reason while walk=="blocked",
+ * regardless of what this variable happens to hold (see
+ * walk_blocked_reason_name's use in handle_state). */
+typedef enum {
+    WALK_BLOCK_NONE, WALK_BLOCK_GUARD, WALK_BLOCK_DOOR,
+    WALK_BLOCK_STATIC, WALK_BLOCK_TIMEOUT
+} walk_blocked_reason_t;
+static walk_blocked_reason_t walk_blocked_reason = WALK_BLOCK_NONE;
+
+static const char* walk_blocked_reason_name(walk_blocked_reason_t r)
+{
+    switch (r) {
+        case WALK_BLOCK_GUARD:   return "\"guard\"";
+        case WALK_BLOCK_DOOR:    return "\"door\"";
+        case WALK_BLOCK_STATIC:  return "\"static\"";
+        case WALK_BLOCK_TIMEOUT: return "\"timeout\"";
+        default:                 return "null";
+    }
+}
+
 /* Direction key codes resolved once at walk start (conf.h KEYVAL bindings
  * don't change mid-game, so caching avoids re-resolving them every tick --
  * see input_pump, which re-resolves per /input request instead since that
@@ -551,8 +578,11 @@ static void handle_state(int cfd)
          * sizeof(json). */
         n += json_prisoner(json+n, sizeof(json)-(size_t)n, i);
     }
-    n = json_append(json, sizeof(json), n, "],\"message\":\"%s\",\"walk\":\"%s\"}",
-                     agent_status_message(), walk_status_name(walk_status));
+    n = json_append(json, sizeof(json), n,
+                     "],\"message\":\"%s\",\"walk\":\"%s\",\"walk_blocked_reason\":%s}",
+                     agent_status_message(), walk_status_name(walk_status),
+                     (walk_status == WALK_BLOCKED)
+                         ? walk_blocked_reason_name(walk_blocked_reason) : "null");
     send_response(cfd, 200, "application/json", json, (size_t)n);
 }
 
@@ -786,6 +816,32 @@ static void handle_room(int cfd)
 #define WALK_MAX_H 72
 #define WALK_MAX_CELLS (WALK_MAX_W * WALK_MAX_H)
 
+/* Task 10: sub-tile grid resolution (see the "mask-accurate sub-tile
+ * pathing" block further down for the mask-sampling design). Defined here,
+ * ahead of walk_path_x/y below, so their capacity can be sized to the
+ * subcell grid's worst case (a raw pre-smoothing BFS path can in principle
+ * visit every cell in the grid) rather than the coarser tile grid's. */
+/* 8x8 subcells per 32x32 tile (4-unit cells) rather than the brief's
+ * suggested 4x4 (8-unit cells): verified live during this task that 8-unit
+ * cells alias badly against this engine's real footprint (SPRITE_FOOTPRINT
+ * is ~12 real px wide, and the per-row vertical scan check_footprint does
+ * is ~4 real px tall -- see mask_footprint_blocked's header comment) --
+ * two adjacent 8-unit-spaced sample points can each individually read
+ * "open" while a real wall/furniture edge sits entirely in the untested
+ * gap between them, and the reverse (a single off-center-but-still-in-
+ * deadband point colliding while the cell's own center doesn't). 4-unit
+ * cells shrink that untested gap to less than the footprint's own
+ * vertical scan step, which eliminates the specific stuck-mid-corridor
+ * failures observed with 8-unit cells in this room's tightest passage
+ * (see the Task 10 report's self-review for the concrete case and the
+ * timing measurement that justified accepting the resulting 4x cell-count
+ * increase). */
+#define SUB_PER_TILE 8                    /* 8x8 subcells per 32x32 tile */
+#define SUB_SIZE (32 / SUB_PER_TILE)      /* 4 -- cell size in px/p2y units */
+#define WALK_SUB_MAX_W (WALK_MAX_W * SUB_PER_TILE)   /* 336 */
+#define WALK_SUB_MAX_H (WALK_MAX_H * SUB_PER_TILE)   /* 288 */
+#define WALK_SUB_MAX_CELLS ((int32_t)WALK_SUB_MAX_W * (int32_t)WALK_SUB_MAX_H) /* ~96.8k */
+
 /* Walkable-floor snapshot (row-major, index y*width+x), taken once when a
  * /walk is accepted and read-only from then on -- the BFS and the pump
  * never re-touch engine state, so a walk in progress is immune to
@@ -811,8 +867,8 @@ static uint16_t walk_width = 0, walk_height = 0;
 /* Waypoint path (tiles strictly after the start tile, through the target
  * inclusive), and the pump's cursor into it. int16_t is ample: tile
  * coordinates never exceed WALK_MAX_W/H. */
-static int16_t walk_path_x[WALK_MAX_CELLS];
-static int16_t walk_path_y[WALK_MAX_CELLS];
+static int16_t walk_path_x[WALK_SUB_MAX_CELLS];
+static int16_t walk_path_y[WALK_SUB_MAX_CELLS];
 static int walk_path_len = 0;
 static int walk_path_idx = 0;
 
@@ -824,6 +880,23 @@ static int walk_path_idx = 0;
  * issued while already standing on that exit tile). */
 static int16_t walk_target_x = 0, walk_target_y = 0;
 static int16_t walk_start_x = 0, walk_start_y = 0;
+
+/* Task 10: the mask-validated WALKABLE subcell within the target tile
+ * (walk_resolve_target_subcell's result at accept/re-path time -- see its
+ * own header comment), used by WALK_PHASE_PATH's steering as the aim
+ * point for ONLY the walk's FINAL waypoint (see walk_pump). A doorway or
+ * other partially-blocked tile's real opening is not always centered in
+ * the tile (readtile/readexit define the tile, not where within its 32x32
+ * footprint the floor actually is) -- verified live during this task: a
+ * room-224 exit tile whose geometric center sits on a wall pixel made
+ * PATH-phase steer toward an unreachable point forever (single manual
+ * key-holds moved the prisoner fine; the deadband math was just aiming at
+ * the wrong spot). Intermediate (non-final) waypoints keep targeting
+ * their tile's plain geometric center, matching the pre-Task10 design --
+ * ordinary interior floor tiles are essentially always fully open, so
+ * there's no benefit (and the usual tight-corridor risk, see walk_bfs_sub's
+ * header comment) to steering them any more precisely than that. */
+static int16_t walk_target_sub_x = 0, walk_target_sub_y = 0;
 
 /* True when the walk's target is an exit/doorway cell (set at accept time
  * in handle_walk, from either an explicit {"exit":N} request or a
@@ -950,7 +1023,15 @@ static int walk_stall_ticks = 0;
 
 /* Deadband (+-units) around a waypoint tile's center so the pump doesn't
  * flap direction keys on/off every tick once the prisoner is already
- * close enough to center. */
+ * close enough to center. WALK_PHASE_PATH's own steering, WALK_PHASE_CROSS's
+ * perpendicular-axis correction, and SIDESTEP's primary-direction-vs-tile-
+ * center comparisons all use this unchanged: every waypoint driven by
+ * key-holding steering is a TILE (32-unit) target (see walk_bfs_sub's
+ * header comment for why -- an earlier version of this task drove
+ * PATH-phase at raw SUBCELL resolution instead, which needed, and got, a
+ * much smaller deadband; that whole approach was reverted after live
+ * testing found it unreliable, so a subcell-scaled deadband is no longer
+ * needed here). */
 #define WALK_DEADBAND 6
 
 /* ---- Task 9: walk-through exits (A) + stall auto-recovery (B) ----
@@ -1035,6 +1116,301 @@ static walk_dir_t walk_sidestep_primary_dir;
 static int walk_sidestep_idx = 0;
 static int walk_sidestep_ticks = 0;
 
+/* ------------------------------------------------------------------ */
+/* Task 10 part A: mask-accurate sub-tile pathing.
+ *
+ * The tile-level BFS above (kept for exit resolution and coarse
+ * reachability -- see walk_grid_walkable/isexit) treats every nonzero
+ * tile as a single all-or-nothing walkable cell. That's tile-blind: a
+ * tile that's mostly floor but partly covered by furniture (a bed, a
+ * table corner) still counts as fully walkable, so the BFS routes the
+ * prisoner straight at it and only the sidestep/corner-rounding recovery
+ * machinery discovers the obstruction -- costing real recovery time
+ * (exactly the "pixel-pockets" weakness this task exists to fix).
+ *
+ * mask_footprint_blocked() below mirrors check_footprint()'s own
+ * mask-sampling math (game.c:2170-2361, via get_tile_props() at
+ * game.c:2114-2164) to test actual wall/furniture geometry at a given
+ * room-pixel position, entirely read-only and using only local state (see
+ * its own header comment for why it never touches game.c's tile_x/
+ * tile_y/mask_offset/exit_offset/exit_dx/tunexit_tool globals). Sampling
+ * this at the center of every 8x8px cell (4x4 cells per 32x32 tile --
+ * SUB_PER_TILE below) builds walk_sub_walkable[], a finer floor grid the
+ * subcell BFS (walk_bfs_sub) paths over instead of the coarse tile grid,
+ * so a route can thread through a pixel-pocket the old tile-level BFS
+ * could only stumble into and then recover from.
+ *
+ * Exit tiles keep working exactly as before: mask_footprint_blocked()
+ * itself already treats an exit-mask overlap as passable (mirroring
+ * check_footprint's own exit_mask collision test, minus the lock/grade
+ * read fair play forbids -- see its header comment), and
+ * walk_snapshot_grid() additionally forces every subcell of a tile the
+ * coarse scan already flagged as an exit cell (readexit()&0x1F) to stay
+ * walkable regardless of the mask probe, as a safety net matching the
+ * existing tile-level convention (never worse than before this task).
+ * (SUB_PER_TILE/SUB_SIZE/WALK_SUB_MAX_* are defined earlier, alongside
+ * WALK_MAX_CELLS, so walk_path_x/y above could be sized off them.) */
+
+static bool walk_sub_walkable[WALK_SUB_MAX_CELLS];
+static uint16_t walk_sub_width = 0, walk_sub_height = 0;
+
+/* Per-tile-id memoized mask/exit table lookup (mirrors get_tile_props,
+ * game.c:2114-2164, minus the tunexit_tool/exit_dx bookkeeping our probe
+ * never needs -- see mask_footprint_blocked's header comment). A subcell
+ * grid probes the same handful of distinct tile ids thousands of times
+ * (16 subcells/tile, and rooms reuse a small palette of tile graphics);
+ * caching each id's resolved offsets the first time it's seen turns the
+ * whole-room subgrid build from O(subcells * (NB_EXITS+NB_TUNNEL_EXITS))
+ * into O(distinct_ids * (NB_EXITS+NB_TUNNEL_EXITS)) -- see
+ * walk_snapshot_grid's timing note for the measured effect. Keyed by the
+ * raw tile value (post TUNNEL_TILE_ADDON, so tunnel/non-tunnel entries
+ * never collide); reset per grid snapshot rather than proven invalidation-
+ * safe, since tile graphics don't change mid-walk and a fresh snapshot is
+ * simple and always correct. */
+#define MASK_TILE_CACHE_SIZE 1024
+static bool mask_cache_valid[MASK_TILE_CACHE_SIZE];
+static uint32_t mask_cache_mask_offset[MASK_TILE_CACHE_SIZE];
+static uint32_t mask_cache_exit_offset[MASK_TILE_CACHE_SIZE];
+
+static void mask_cache_reset(void)
+{
+    memset(mask_cache_valid, 0, sizeof(mask_cache_valid));
+}
+
+static void mask_get_tile_props(uint32_t tile, uint32_t* out_mask_offset,
+                                 uint32_t* out_exit_offset)
+{
+    uint8_t u;
+    uint32_t mask_offset, exit_offset;
+
+    if (tile < MASK_TILE_CACHE_SIZE && mask_cache_valid[tile]) {
+        *out_mask_offset = mask_cache_mask_offset[tile];
+        *out_exit_offset = mask_cache_exit_offset[tile];
+        return;
+    }
+
+    exit_offset = MASK_EMPTY;
+    for (u = 0; u < NB_EXITS; u++) {
+        if (readword((uint8_t*)fbuffer[LOADER], EXIT_TILES_LIST + 2*u) == tile) {
+            exit_offset = EXIT_MASKS_START +
+                readword((uint8_t*)fbuffer[LOADER], EXIT_MASKS_OFFSETS + 2*u);
+            break;
+        }
+    }
+    for (u = 0; u < NB_TUNNEL_EXITS; u++) {
+        if (readword((uint8_t*)fbuffer[LOADER], TUNNEL_EXIT_TILES_LIST + 2*u) == tile)
+            break;
+    }
+    if (u < IN_TUNNEL_EXITS_START)
+        mask_offset = MASK_FULL;
+    else
+        mask_offset = TILE_MASKS_START +
+            readlong((uint8_t*)fbuffer[LOADER], TILE_MASKS_OFFSETS + (tile<<2));
+
+    if (tile < MASK_TILE_CACHE_SIZE) {
+        mask_cache_valid[tile] = true;
+        mask_cache_mask_offset[tile] = mask_offset;
+        mask_cache_exit_offset[tile] = exit_offset;
+    }
+    *out_mask_offset = mask_offset;
+    *out_exit_offset = exit_offset;
+}
+
+/* Read-only mirror of check_footprint()'s mask-sampling loop
+ * (game.c:2170-2361): does a footprint centered at room-pixel (px,p2y)
+ * [p2y doubled-Y, same convention as guybrush[].p2y] collide with wall
+ * geometry? `tunnel` mirrors in_tunnel. Exit-mask overlaps are always
+ * treated as open -- collision(footprint,exit_mask) true means "this wall
+ * hit is actually a doorway", which check_footprint would resolve by
+ * reading exit_flags (locked/grade); we never do that (fair play), so we
+ * take the same stance the existing tile-level readexit()&0x1F test
+ * already takes: an exit cell is walkable, full stop. Caller must already
+ * have called set_room_xy() for the room being probed (room_x/room_y/
+ * offset live) -- same precondition walk_snapshot_grid's own caller
+ * context establishes; this function never calls it itself so a whole
+ * subgrid build doesn't redundantly re-resolve room_x/room_y per cell. */
+static bool mask_footprint_blocked(int16_t px, int16_t p2y, bool tunnel)
+{
+    uint32_t mask_offset[4], exit_offset[4];
+    int16_t tile_x, tile_y;
+    uint32_t footprint = tunnel ? TUNNEL_FOOTPRINT : SPRITE_FOOTPRINT;
+    uint16_t mask_y;
+    uint8_t i, u;
+    int room_px_limit, room_py_limit;
+
+    if (tunnel) px = (int16_t)(px - 16);
+    p2y = (int16_t)(p2y - 1);
+
+    tile_y = (int16_t)(p2y / 32);
+    tile_x = (int16_t)(px / 32);
+
+    room_px_limit = 32 * (int)room_x - 6;
+    room_py_limit = 32 * (int)room_y - 6;
+    if (px < 0 || p2y < 0 || px >= room_px_limit || p2y >= room_py_limit)
+        return true;
+
+    for (i = 0; i < 2; i++) {
+        uint32_t tile = readtile(tile_x, tile_y) +
+            (tunnel ? (uint32_t)TUNNEL_TILE_ADDON : 0);
+        mask_get_tile_props(tile, &mask_offset[2*i], &exit_offset[2*i]);
+        if ((px & 0x1F) < 16) {
+            mask_offset[2*i+1] = mask_offset[2*i] + 2;
+            exit_offset[2*i+1] = exit_offset[2*i] + 2;
+        } else {
+            mask_offset[2*i] += 2;
+            exit_offset[2*i] += 2;
+            if ((int)(tile_x+1) < (int)room_x) {
+                uint32_t tile2 = readtile(tile_x+1, tile_y) +
+                    (tunnel ? (uint32_t)TUNNEL_TILE_ADDON : 0);
+                mask_get_tile_props(tile2, &mask_offset[2*i+1], &exit_offset[2*i+1]);
+            } else {
+                exit_offset[2*i+1] = MASK_EMPTY;
+                mask_offset[2*i+1] = MASK_EMPTY;
+            }
+        }
+        tile_y++;
+    }
+
+    mask_y = (uint16_t)((p2y & 0x1E) << 1);
+    mask_offset[0] = (uint32_t)(mask_offset[0] + mask_y);
+    mask_offset[1] = (uint32_t)(mask_offset[1] + mask_y);
+    exit_offset[0] = (uint32_t)(exit_offset[0] + mask_y);
+    exit_offset[1] = (uint32_t)(exit_offset[1] + mask_y);
+
+    footprint >>= (px & 0x0F);
+
+    for (i = 0; i < FOOTPRINT_HEIGHT; i++) {
+        uint32_t tile_mask = to_long(
+            readword((uint8_t*)fbuffer[LOADER], mask_offset[0]),
+            readword((uint8_t*)fbuffer[LOADER], mask_offset[1]));
+        uint32_t exit_mask = to_long(
+            readword((uint8_t*)fbuffer[LOADER], exit_offset[0]),
+            readword((uint8_t*)fbuffer[LOADER], exit_offset[1]));
+
+        if (inverted_collision(footprint, tile_mask))
+            return !collision(footprint, exit_mask);
+
+        mask_y += 4;
+        for (u = 0; u < 2; u++) {
+            if (mask_y == 0x40) {
+                mask_offset[u] = mask_offset[u+2];
+                exit_offset[u] = exit_offset[u+2];
+            } else {
+                mask_offset[u] += 4;
+                exit_offset[u] += 4;
+            }
+        }
+    }
+    return false;
+}
+
+/* Picks the subcell of tile (tile_x,tile_y) nearest to bias point
+ * (bias_px,bias_p2y) among that tile's SUB_PER_TILE^2 subcells that
+ * walk_sub_walkable[] actually marks walkable -- used to turn a tile-level
+ * target (an exit tile, a plain {"tile":[x,y]} request, or an item's own
+ * tile) into a concrete subcell BFS target biased toward the doorway/tile
+ * center or (for item walks) the exact pickup anchor, so the subsequent
+ * ITEM_PIXEL/CROSS phase starts as close as possible. Falls back to the
+ * tile's own center-ish subcell (index (1,1) of 0..SUB_PER_TILE-1) if
+ * NONE of the tile's subcells are walkable -- so this always returns some
+ * subcell rather than failing; the subcell BFS itself is the authority on
+ * whether that subcell is actually reachable. */
+static void walk_resolve_target_subcell(int16_t tile_x, int16_t tile_y,
+                                         int16_t bias_px, int16_t bias_p2y,
+                                         int16_t* out_sx, int16_t* out_sy)
+{
+    int si, sj, best_si = 1, best_sj = 1;   /* sane default for SUB_PER_TILE==4 */
+    long best_d = -1;
+    bool found = false;
+
+    for (sj = 0; sj < SUB_PER_TILE; sj++) {
+        for (si = 0; si < SUB_PER_TILE; si++) {
+            int sub_x = tile_x*SUB_PER_TILE + si;
+            int sub_y = tile_y*SUB_PER_TILE + sj;
+            int idx = sub_y*(int)walk_sub_width + sub_x;
+            long dpx, dpy, d;
+            if (idx < 0 || idx >= WALK_SUB_MAX_CELLS || !walk_sub_walkable[idx])
+                continue;
+            dpx = (tile_x*32 + si*SUB_SIZE + SUB_SIZE/2) - bias_px;
+            dpy = (tile_y*32 + sj*SUB_SIZE + SUB_SIZE/2) - bias_p2y;
+            d = dpx*dpx + dpy*dpy;
+            if (!found || d < best_d) { found = true; best_d = d; best_si = si; best_sj = sj; }
+        }
+    }
+    *out_sx = (int16_t)(tile_x*SUB_PER_TILE + best_si);
+    *out_sy = (int16_t)(tile_y*SUB_PER_TILE + best_sj);
+}
+
+/* Clamps the current prisoner's exact pixel position down to a subcell
+ * coordinate within the current walk_sub_width/height snapshot -- the
+ * subcell-BFS analogue of the tile-level sx/sy clamp every handle_walk/
+ * walk_sidestep_finish/walk_item_try_next_side call site used to do
+ * inline; factored out once all three need it at subcell resolution. */
+static void walk_sub_clamp_start(int16_t* out_sx, int16_t* out_sy)
+{
+    int16_t sx = (int16_t)(guybrush[current_nation].px / SUB_SIZE);
+    int16_t sy = (int16_t)(guybrush[current_nation].p2y / SUB_SIZE);
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx >= (int16_t)walk_sub_width)  sx = (int16_t)walk_sub_width - 1;
+    if (sy >= (int16_t)walk_sub_height) sy = (int16_t)walk_sub_height - 1;
+    *out_sx = sx; *out_sy = sy;
+}
+
+/* Task 10 part B: classifies WHY the walk just stalled, at the moment a
+ * stall is about to become a "blocked" result (final-waypoint stall with
+ * no recovery left, sidestep-recovery re-path itself failing, corner-
+ * rounding exhausted with no more approach sides). Order matters: door
+ * (exit-tile-specific geometry) is checked before guard (a guard standing
+ * in a doorway is still, first and foremost, a door the walk couldn't get
+ * through) is checked before the generic static fallback. guard/door are
+ * on-screen-visible facts (same fair-play tier as /room and /state's own
+ * per-prisoner positions) -- this never reads exit lock/grade state. */
+#define WALK_BLOCKED_GUARD_RADIUS 24
+static walk_blocked_reason_t walk_classify_stall(void)
+{
+    int16_t my_px = guybrush[current_nation].px;
+    int16_t my_p2y = guybrush[current_nation].p2y;
+    uint16_t my_room = guybrush[current_nation].room;
+    int i;
+
+    if (walk_is_exit_target) {
+        int16_t dtx = (int16_t)(my_px / 32), dty = (int16_t)(my_p2y / 32);
+        int dist = abs((int)dtx - (int)walk_target_x) + abs((int)dty - (int)walk_target_y);
+        /* Adjacency (Manhattan tile distance <=1), not just an exact
+         * match -- a locked/closed door stall can happen one tile short
+         * of the doorway (the approach itself stalls before ever reaching
+         * the exact exit tile; matches the same adjacency threshold
+         * walk_pump's stall handler uses to hand off to WALK_PHASE_CROSS,
+         * see its own comment) just as readily as a stall exactly on it. */
+        if (dist <= 1)
+            return WALK_BLOCK_DOOR;
+    }
+
+    for (i = 0; i < NB_GUYBRUSHES; i++) {
+        int16_t dpx, dp2y;
+        if (i == current_nation) continue;
+        if (guybrush[i].room != my_room) continue;
+        dpx  = (int16_t)(guybrush[i].px  - my_px);
+        dp2y = (int16_t)(guybrush[i].p2y - my_p2y);
+        if (dpx < 0) dpx = (int16_t)-dpx;
+        if (dp2y < 0) dp2y = (int16_t)-dp2y;
+        if (dpx <= WALK_BLOCKED_GUARD_RADIUS && dp2y <= WALK_BLOCKED_GUARD_RADIUS)
+            return WALK_BLOCK_GUARD;
+    }
+
+    return WALK_BLOCK_STATIC;
+}
+
+/* Single choke point pairing every walk_cancel(WALK_BLOCKED) call with the
+ * reason that produced it -- mirrors walk_cancel() itself being the single
+ * choke point for key release. */
+static void walk_set_blocked(walk_blocked_reason_t reason)
+{
+    walk_blocked_reason = reason;
+    walk_cancel(WALK_BLOCKED);
+}
+
 enum { WALK_SNAP_OK = 0, WALK_SNAP_NO_ROOM, WALK_SNAP_BAD_EXIT };
 
 /* Snapshots the CURRENT room's walkable floor into walk_grid_walkable[]
@@ -1091,69 +1467,215 @@ static int walk_snapshot_grid(uint16_t* out_width, uint16_t* out_height,
         }
     }
 
+    /* Task 10 part A: mask-accurate subcell grid, built in the same
+     * room_x/room_y/offset-live window as the tile scan above (mask
+     * lookups need room_x for the same "does the neighbor tile exist"
+     * bound check check_footprint's own get_tile_props does). Timed via
+     * mtime() and reported through printb (opt_debug-gated, so this is a
+     * zero-cost no-op in a normal run) -- see the brief's "VERIFY timing"
+     * requirement; worst case is the full outside map, 84*72 tiles * 16
+     * subcells = ~96.8k mask probes. */
+    {
+        bool tunnel = (guybrush[current_nation].state & STATE_TUNNELING) != 0;
+        uint16_t sub_w = (uint16_t)(width * SUB_PER_TILE);
+        uint16_t sub_h = (uint16_t)(height * SUB_PER_TILE);
+        int tx, ty, si, sj;
+        uint64_t t0 = mtime();
+
+        mask_cache_reset();
+        for (ty = 0; ty < (int)height; ty++) {
+            for (tx = 0; tx < (int)width; tx++) {
+                bool tile_is_exit = walk_grid_isexit[ty*(int)width + tx];
+                for (sj = 0; sj < SUB_PER_TILE; sj++) {
+                    for (si = 0; si < SUB_PER_TILE; si++) {
+                        int16_t cx = (int16_t)(tx*32 + si*SUB_SIZE + SUB_SIZE/2);
+                        int16_t cy = (int16_t)(ty*32 + sj*SUB_SIZE + SUB_SIZE/2);
+                        int sub_idx = (ty*SUB_PER_TILE+sj)*(int)sub_w +
+                                      (tx*SUB_PER_TILE+si);
+                        bool blocked = mask_footprint_blocked(cx, cy, tunnel);
+                        walk_sub_walkable[sub_idx] = (!blocked) || tile_is_exit;
+                    }
+                }
+            }
+        }
+        walk_sub_width = sub_w;
+        walk_sub_height = sub_h;
+        printb("walk: subgrid %ux%u (%d cells, tunnel=%d) built in %llums\n",
+               sub_w, sub_h, (int)sub_w*(int)sub_h, (int)tunnel,
+               (unsigned long long)(mtime() - t0));
+    }
+
     room_x = saved_room_x; room_y = saved_room_y; offset = saved_offset;
     *out_width = width; *out_height = height;
     return found_exit ? WALK_SNAP_OK : WALK_SNAP_BAD_EXIT;
 }
 
-/* 4-connected BFS from (sx,sy) to (tx,ty) over walk_grid_walkable[] (already
- * populated by walk_snapshot_grid, width x height). On success, fills
- * walk_path_x/y[0..*out_len-1] with the waypoint tiles strictly after the
- * start tile through the target inclusive, and returns true. All working
- * arrays are function-local static (bounded at WALK_MAX_CELLS, matching
- * the grid's own cap) so this never mallocs and never touches the stack
- * for anything path-length-sized. */
-static bool walk_bfs(uint16_t width, uint16_t height,
-                     int16_t sx, int16_t sy, int16_t tx, int16_t ty,
-                     int* out_len)
+/* Converts a raw subcell path (walk_path_x/y[0..len-1], as reconstructed
+ * by walk_bfs_sub from its BFS parent-pointer walk) into a deduplicated
+ * TILE path, in place -- the design walk_bfs_sub actually ships with; see
+ * its own header comment for why PATH-phase steering targets tiles
+ * (32-unit, WALK_DEADBAND) rather than raw subcells despite the BFS itself
+ * running at subcell (mask-accurate) resolution. `start_sub_x/y` is the
+ * BFS's own start subcell (not itself stored in the path array). Every
+ * kept tile is exactly one step (in tile-space) from the previous kept
+ * tile: a 4-connected subcell step can cross at most one tile boundary,
+ * so two DIFFERENT consecutive tiles in the dedup'd output are always
+ * adjacent -- this is what still lets walk_exit_dir_candidates treat
+ * consecutive path entries as a reliable direction-of-arrival signal. The
+ * output cursor `out` never exceeds the read cursor `k`, so writing
+ * behind it (in place, into the same walk_path_x/y arrays the raw subcell
+ * path was just read from) is safe. Returns the number of tiles written
+ * (0 for a zero-length subcell path, i.e. start and target were already
+ * the same subcell -- their shared tile isn't itself emitted, matching
+ * the pre-existing "target tile == start tile" convention every caller
+ * already relies on for a zero-length walk). */
+static int walk_path_to_tiles(int16_t start_sub_x, int16_t start_sub_y, int len)
 {
-    static int16_t prev[WALK_MAX_CELLS];
-    static int16_t queue[WALK_MAX_CELLS];
-    static bool visited[WALK_MAX_CELLS];
-    static int16_t rev[WALK_MAX_CELLS];
+    int out = 0, k;
+    int16_t prev_tx = (int16_t)(start_sub_x / SUB_PER_TILE);
+    int16_t prev_ty = (int16_t)(start_sub_y / SUB_PER_TILE);
+
+    for (k = 0; k < len; k++) {
+        int16_t tx = (int16_t)(walk_path_x[k] / SUB_PER_TILE);
+        int16_t ty = (int16_t)(walk_path_y[k] / SUB_PER_TILE);
+        if (tx != prev_tx || ty != prev_ty) {
+            walk_path_x[out] = tx;
+            walk_path_y[out] = ty;
+            out++;
+            prev_tx = tx; prev_ty = ty;
+        }
+    }
+    return out;
+}
+
+/* 4-connected BFS from subcell (sx,sy) to (tx,ty) over walk_sub_walkable[]
+ * (already populated by walk_snapshot_grid, sub_w x sub_h -- see the
+ * "mask-accurate sub-tile pathing" block above): the REACHABILITY test is
+ * mask-accurate subcell resolution, so a tile that's only PARTIALLY open
+ * (furniture covering most, but not all, of it) is routed around/through
+ * correctly instead of the coarse tile-level BFS's blind "any nonzero
+ * pixel counts" test -- this is what actually fixes "BFS is tile-blind".
+ * On success, fills walk_path_x/y[0..*out_len-1] with a DEDUPLICATED TILE
+ * path (walk_path_to_tiles above), strictly after the start's tile through
+ * the target's tile inclusive, and returns true.
+ *
+ * DESIGN NOTE (why waypoints are tiles, not raw subcells -- see the Task
+ * 10 report's self-review for the full write-up): an earlier version of
+ * this function returned smoothed SUBCELL waypoints directly, and drove
+ * WALK_PHASE_PATH's steering at that same resolution. Verified live during
+ * this task that this is NOT reliably steerable: PATH-phase's simultaneous
+ * 2-axis deadband steering, and the stall-recovery amplitudes (SIDESTEP's
+ * fixed-tick perpendicular probes, ITEM_PIXEL's 12/24px corner-rounding),
+ * are all tuned to TILE scale (32 units) and become unreliable at subcell
+ * scale (4-8 units) in tight/diagonal room geometry -- concretely, room
+ * 251's own floor shape (a diagonal wall, verified via the mask probe
+ * itself, not a guess) repeatedly stalled a pure-subcell walk in a way
+ * neither the sidestep nor the one-shot re-path recovery could reliably
+ * escape, even though the SAME underlying tiles, driven at tile
+ * resolution with the SAME recovery machinery, are what this exact walk
+ * already passed against before Task 10. Resampling the mask-accurate
+ * subcell path down to its distinct tiles keeps the reachability
+ * improvement (a tile with zero walkable subcells is now correctly
+ * excluded, and a tile only reachable via a specific corner is still
+ * found) while driving the actual walk with the SAME steering/recovery
+ * design that was already proven reliable -- the smoothing this now does
+ * is at tile granularity, same as the old tile-level walk_bfs effectively
+ * needed no separate smoothing step for (consecutive tile-level BFS steps
+ * are never collinear-mergeable beyond what tile adjacency already is).
+ *
+ * Same overall structure as the retired tile-level walk_bfs, but cell
+ * indices are int32_t throughout during the subcell search (a subcell
+ * grid can exceed WALK_SUB_MAX_CELLS ~387k, well past int16_t's +-32767
+ * range, unlike the tile grid's <=6048 cells) -- only the FINAL x/y
+ * coordinates written into walk_path_x/y (tile indices, tiny) are
+ * int16_t. */
+static bool walk_bfs_sub(uint16_t sub_w, uint16_t sub_h,
+                          int16_t sx, int16_t sy, int16_t tx, int16_t ty,
+                          int* out_len)
+{
+    static int32_t prev[WALK_SUB_MAX_CELLS];
+    static int32_t queue[WALK_SUB_MAX_CELLS];
+    static bool visited[WALK_SUB_MAX_CELLS];
+    static int32_t rev[WALK_SUB_MAX_CELLS];
     static const int8_t dxs[4] = { 1, -1, 0, 0 };
     static const int8_t dys[4] = { 0, 0, 1, -1 };
-    int qh = 0, qt = 0, i;
-    int start = sy*(int)width + sx, target = ty*(int)width + tx;
+    int32_t qh = 0, qt = 0, i;
+    int32_t start = (int32_t)sy*(int32_t)sub_w + sx;
+    int32_t target = (int32_t)ty*(int32_t)sub_w + tx;
+    uint64_t t0 = mtime();
 
-    if (!walk_grid_walkable[start] || !walk_grid_walkable[target])
+    /* The START cell is never rejected on walkability, only the target is:
+     * the prisoner is, by construction, ALREADY standing somewhere inside
+     * it (real check_footprint calls already validated their exact pixel
+     * position every tick they walked there) -- but a single mask sample
+     * at the cell's geometric CENTER can legitimately disagree with a
+     * pixel a few units away within that same cell (the footprint's own
+     * ~4px real-pixel height is comparable to the 8-unit subcell size, so
+     * near an edge, "is the center open" and "is the actual standing spot
+     * open" can differ). Treating the start as reachable regardless keeps
+     * that sampling granularity from ever manufacturing a spurious "no
+     * path" purely because of where, within its cell, the walk happens to
+     * begin -- BFS expansion from it still requires each subsequent
+     * neighbor cell to test walkable, so this doesn't relax anything about
+     * the route itself, only the (trivially true) fact that where the
+     * prisoner already is counts as reachable. */
+    if (!walk_sub_walkable[target])
         return false;
 
-    memset(visited, 0, (size_t)width * (size_t)height * sizeof(bool));
+    memset(visited, 0, (size_t)sub_w * (size_t)sub_h * sizeof(bool));
     visited[start] = true;
     prev[start] = -1;
-    queue[qt++] = (int16_t)start;
+    queue[qt++] = start;
 
     while (qh < qt) {
-        int u = queue[qh++];
-        int ux = u % (int)width, uy = u / (int)width;
+        int32_t u = queue[qh++];
+        int32_t ux = u % (int32_t)sub_w, uy = u / (int32_t)sub_w;
         if (u == target) break;
+        /* No edge-midpoint check between adjacent cell centers here (an
+         * earlier version of this loop had one): tried at the original
+         * 8-unit cell size to guard against a thin obstacle sitting
+         * entirely in the gap between two sample points, but it rejected
+         * genuinely-connected diagonal corridors instead -- a staircase-
+         * shaped wall's orthogonal-neighbor midpoints can legitimately
+         * sit ON the diagonal boundary even though both cells, and the
+         * real deadband-corrected transit between them, are fine (see the
+         * Task 10 report's self-review for the concrete case). Shrinking
+         * SUB_SIZE to 4 units (below the engine's own ~4px vertical
+         * mask-scan step, see mask_footprint_blocked's header comment)
+         * fixes the gap-aliasing problem at its root -- the sample
+         * spacing itself -- making a per-edge check both unnecessary and
+         * (for diagonal geometry) actively harmful. */
         for (i = 0; i < 4; i++) {
-            int nx = ux + dxs[i], ny = uy + dys[i], v;
-            if (nx < 0 || ny < 0 || nx >= (int)width || ny >= (int)height)
+            int32_t nx = ux + dxs[i], ny = uy + dys[i], v;
+            if (nx < 0 || ny < 0 || nx >= (int32_t)sub_w || ny >= (int32_t)sub_h)
                 continue;
-            v = ny*(int)width + nx;
-            if (!walk_grid_walkable[v] || visited[v]) continue;
+            v = ny*(int32_t)sub_w + nx;
+            if (!walk_sub_walkable[v] || visited[v]) continue;
             visited[v] = true;
-            prev[v] = (int16_t)u;
-            queue[qt++] = (int16_t)v;
+            prev[v] = u;
+            queue[qt++] = v;
         }
     }
 
-    if (!visited[target]) return false;
+    if (!visited[target])
+        return false;
 
     {
-        int len = 0, cur = target;
+        int len = 0;
+        int32_t cur = target;
         while (cur != start) {
-            rev[len++] = (int16_t)cur;
+            rev[len++] = cur;
             cur = prev[cur];
         }
         for (i = 0; i < len; i++) {
-            int cell = rev[len-1-i];
-            walk_path_x[i] = (int16_t)(cell % (int)width);
-            walk_path_y[i] = (int16_t)(cell / (int)width);
+            int32_t cell = rev[len-1-i];
+            walk_path_x[i] = (int16_t)(cell % (int32_t)sub_w);
+            walk_path_y[i] = (int16_t)(cell / (int32_t)sub_w);
         }
-        *out_len = len;
+        *out_len = walk_path_to_tiles(sx, sy, len);
+        printb("walk: bfs_sub %ux%u raw_sub_len=%d tile_len=%d took %llums\n",
+               sub_w, sub_h, len, *out_len,
+               (unsigned long long)(mtime() - t0));
     }
     return true;
 }
@@ -1274,10 +1796,19 @@ static int walk_exit_dir_candidates(int16_t ex, int16_t ey, walk_dir_t* out)
         }
         tx = walk_path_x[walk_path_len - 1];
         ty = walk_path_y[walk_path_len - 1];
-        if      (tx - fx ==  1) { arrival = WALK_DIR_RIGHT; have_arrival = true; }
-        else if (tx - fx == -1) { arrival = WALK_DIR_LEFT;  have_arrival = true; }
-        else if (ty - fy ==  1) { arrival = WALK_DIR_DOWN;  have_arrival = true; }
-        else if (ty - fy == -1) { arrival = WALK_DIR_UP;    have_arrival = true; }
+        /* walk_path_x/y are tile waypoints derived from a mask-accurate
+         * SUBCELL search (walk_bfs_sub/walk_path_to_tiles) rather than a
+         * raw tile-level BFS, but walk_path_to_tiles guarantees the same
+         * invariant a raw tile BFS would: two DIFFERENT consecutive
+         * entries are always exactly one tile apart (a 4-connected
+         * subcell step can cross at most one tile boundary). The SIGN of
+         * the delta (rather than an exact +-1 equality test) still
+         * unambiguously gives the direction of travel on whichever axis
+         * actually moved, and works either way. */
+        if      (tx - fx >  0) { arrival = WALK_DIR_RIGHT; have_arrival = true; }
+        else if (tx - fx <  0) { arrival = WALK_DIR_LEFT;  have_arrival = true; }
+        else if (ty - fy >  0) { arrival = WALK_DIR_DOWN;  have_arrival = true; }
+        else if (ty - fy <  0) { arrival = WALK_DIR_UP;    have_arrival = true; }
     }
 
     if (have_arrival && walk_dir_qualifies(ex, ey, arrival))
@@ -1326,7 +1857,14 @@ static void walk_pump_cross(void)
             walk_cross_idx = 0;
             walk_cross_round++;
             if (walk_cross_round >= WALK_CROSS_MAX_ROUNDS) {
-                walk_cancel(WALK_BLOCKED);
+                /* Every candidate outward direction exhausted its leg
+                 * budget with no room change -- Task 10 part B: this is
+                 * definitionally the CROSS phase giving up, so "door" per
+                 * the brief regardless of what walk_classify_stall() would
+                 * otherwise guess (a guard could ALSO be blocking the
+                 * doorway, but the phase itself is the more specific,
+                 * more useful signal here). */
+                walk_set_blocked(WALK_BLOCK_DOOR);
                 return;
             }
         }
@@ -1335,8 +1873,19 @@ static void walk_pump_cross(void)
     d   = walk_cross_cand[walk_cross_idx];
     px  = guybrush[current_nation].px;
     p2y = guybrush[current_nation].p2y;
-    cx  = (int16_t)(walk_target_x * 32 + 16);
-    cy  = (int16_t)(walk_target_y * 32 + 16);
+    /* Perpendicular-correction target: the mask-validated walkable
+     * subcell (walk_target_sub_x/y) rather than the tile's raw geometric
+     * center -- a doorway's real opening is not always centered in its
+     * tile (see walk_target_sub_x/y's own header comment), and the plain
+     * center can itself sit outside the actual passable column. Still not
+     * a full fix for every possible off-center doorway (the mask-
+     * validated point is the WALKABLE column nearest the tile's center,
+     * not necessarily the doorway's own -- see the Task 10 report for a
+     * documented residual case), but strictly better than the fixed tile
+     * center for any doorway whose opening is off-center but still
+     * reasonably close to it. */
+    cx  = (int16_t)(walk_target_sub_x * SUB_SIZE + SUB_SIZE/2);
+    cy  = (int16_t)(walk_target_sub_y * SUB_SIZE + SUB_SIZE/2);
 
     /* Pin the primary (outward) axis. */
     if (d == WALK_DIR_LEFT) {
@@ -1389,26 +1938,42 @@ static void walk_pump_cross(void)
 static void walk_sidestep_finish(void)
 {
     uint16_t width = 0, height = 0;
-    int16_t sx, sy;
+    int16_t ssx, ssy, stx, sty, bias_px, bias_p2y;
     int new_len = 0, snap;
 
     walk_release_keys();
     snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
-    if (snap != WALK_SNAP_OK) { walk_cancel(WALK_BLOCKED); return; }
+    if (snap != WALK_SNAP_OK) { walk_set_blocked(walk_classify_stall()); return; }
     walk_width = width;
     walk_height = height;
 
-    sx = guybrush[current_nation].px / 32;
-    sy = guybrush[current_nation].p2y / 32;
-    if (sx < 0) sx = 0;
-    if (sy < 0) sy = 0;
-    if (sx >= (int16_t)width)  sx = (int16_t)width  - 1;
-    if (sy >= (int16_t)height) sy = (int16_t)height - 1;
-
     if (walk_target_x < 0 || walk_target_y < 0 ||
-        walk_target_x >= (int16_t)width || walk_target_y >= (int16_t)height ||
-        !walk_bfs(width, height, sx, sy, walk_target_x, walk_target_y, &new_len)) {
-        walk_cancel(WALK_BLOCKED);
+        walk_target_x >= (int16_t)width || walk_target_y >= (int16_t)height) {
+        walk_set_blocked(walk_classify_stall());
+        return;
+    }
+
+    /* Bias toward the TILE's center even for an item walk, not the exact
+     * item pickup anchor -- see walk_resolve_target_subcell's call sites
+     * in handle_walk for why: PATH-phase (simple simultaneous 2-axis
+     * deadband steering) only needs to get the prisoner into the general
+     * vicinity of the target tile, exactly like a plain-tile walk. Final
+     * pixel-precision approach into a tight furniture pocket is
+     * WALK_PHASE_ITEM_PIXEL's job (dedicated single-axis steering +
+     * bounded corner-rounding) -- biasing PATH-phase's own subcell target
+     * toward the anchor was tried and found to route PATH-phase itself
+     * through the same tight geometry ITEM_PIXEL exists to handle,
+     * defeating that separation (see the Task 10 report's self-review). */
+    walk_sub_clamp_start(&ssx, &ssy);
+    bias_px = (int16_t)(walk_target_x*32 + 16);
+    bias_p2y = (int16_t)(walk_target_y*32 + 16);
+    walk_resolve_target_subcell(walk_target_x, walk_target_y, bias_px, bias_p2y,
+                                 &stx, &sty);
+    walk_target_sub_x = stx;
+    walk_target_sub_y = sty;
+
+    if (!walk_bfs_sub(walk_sub_width, walk_sub_height, ssx, ssy, stx, sty, &new_len)) {
+        walk_set_blocked(walk_classify_stall());
         return;
     }
 
@@ -1537,7 +2102,7 @@ static bool walk_item_try_next_side(void)
     static const int8_t adx[4] = { 1, -1, 0, 0 };   /* E, W, S, N */
     static const int8_t ady[4] = { 0, 0, 1, -1 };
     uint16_t width = 0, height = 0;
-    int16_t sx, sy;
+    int16_t ssx, ssy;
     int i, new_len = 0;
 
     if (walk_item_prop_tx < 0 ||
@@ -1545,16 +2110,12 @@ static bool walk_item_try_next_side(void)
         return false;
     walk_width = width;
     walk_height = height;
-    sx = guybrush[current_nation].px / 32;
-    sy = guybrush[current_nation].p2y / 32;
-    if (sx < 0) sx = 0;
-    if (sy < 0) sy = 0;
-    if (sx >= (int16_t)width)  sx = (int16_t)width  - 1;
-    if (sy >= (int16_t)height) sy = (int16_t)height - 1;
+    walk_sub_clamp_start(&ssx, &ssy);
 
     for (i = 0; i < 4; i++) {
         int16_t nx = (int16_t)(walk_item_prop_tx + adx[i]);
         int16_t ny = (int16_t)(walk_item_prop_ty + ady[i]);
+        int16_t stx, sty;
         if (walk_item_tried_mask & (uint8_t)(1 << i))
             continue;
         walk_item_tried_mask |= (uint8_t)(1 << i);
@@ -1562,10 +2123,17 @@ static bool walk_item_try_next_side(void)
             continue;
         if (!walk_grid_walkable[(int)ny*(int)width + nx])
             continue;
-        if (!walk_bfs(width, height, sx, sy, nx, ny, &new_len))
+        /* Tile-center bias, not the item anchor -- see handle_walk's
+         * matching comment: PATH-phase only needs to reach the general
+         * vicinity of this approach tile, not the precise pickup pixel. */
+        walk_resolve_target_subcell(nx, ny, (int16_t)(nx*32 + 16),
+                                     (int16_t)(ny*32 + 16), &stx, &sty);
+        if (!walk_bfs_sub(walk_sub_width, walk_sub_height, ssx, ssy, stx, sty, &new_len))
             continue;
         walk_target_x = nx;
         walk_target_y = ny;
+        walk_target_sub_x = stx;
+        walk_target_sub_y = sty;
         walk_path_len = new_len;
         walk_path_idx = 0;
         walk_item_round = 0;                /* fresh rounding budget per side */
@@ -1620,7 +2188,7 @@ static void walk_item_round_exhausted(int16_t px, int16_t p2y, bool primary_is_x
         walk_stall_p2y = p2y;
         return;
     }
-    walk_cancel(WALK_BLOCKED);
+    walk_set_blocked(walk_classify_stall());
 }
 
 /* Runs one tick of the current corner-rounding round (walk_pump_item_pixel
@@ -1759,13 +2327,16 @@ static void walk_pump(void)
 
     /* Prisoner switch (agent-initiated via /input, or a human at the real
      * keyboard) invalidates the walk's whole premise -- stop and call it
-     * blocked, per the brief. */
-    if (current_nation != walk_nation) { walk_cancel(WALK_BLOCKED); return; }
+     * blocked, per the brief. Not a stall (nothing to classify), so this
+     * uses the generic "static" bucket rather than walk_classify_stall(). */
+    if (current_nation != walk_nation) { walk_set_blocked(WALK_BLOCK_STATIC); return; }
 
     /* Whole-walk hard cap (part B): bounds path-following + one
      * sidestep-recovery attempt + crossing all taking their maximum time
-     * in sequence, protecting against any pathological loop. */
-    if (++walk_total_ticks > WALK_MAX_TICKS) { walk_cancel(WALK_BLOCKED); return; }
+     * in sequence, protecting against any pathological loop. Always
+     * "timeout" regardless of which phase it interrupted -- the 30s cap is
+     * its own distinct, unambiguous cause. */
+    if (++walk_total_ticks > WALK_MAX_TICKS) { walk_set_blocked(WALK_BLOCK_TIMEOUT); return; }
 
     /* Room change is success on every phase -- the walk got the prisoner
      * out of the room. This doubles as the CROSSING phase's actual
@@ -1777,8 +2348,12 @@ static void walk_pump(void)
     if (walk_phase == WALK_PHASE_SIDESTEP)   { walk_pump_sidestep();   return; }
     if (walk_phase == WALK_PHASE_ITEM_PIXEL) { walk_pump_item_pixel(); return; }
 
-    /* WALK_PHASE_PATH: follow the BFS path (Task 8 behavior), plus the
-     * stall -> one-shot sidestep-recovery hook (part B) and the
+    /* WALK_PHASE_PATH: follow the BFS path -- TILE-resolution waypoints
+     * (Task 10: now derived from a mask-accurate SUBCELL reachability
+     * search via walk_bfs_sub/walk_path_to_tiles, see their header
+     * comments for why the search runs at subcell resolution but the
+     * waypoints it hands to this steering loop are still tiles) -- plus
+     * the stall -> one-shot sidestep-recovery hook (part B) and the
      * target-reached -> CROSSING-phase handoff (part A). */
     px  = guybrush[current_nation].px;
     p2y = guybrush[current_nation].p2y;
@@ -1787,6 +2362,34 @@ static void walk_pump(void)
 
     if (px == walk_stall_px && p2y == walk_stall_p2y) {
         if (++walk_stall_ticks >= WALK_STALL_LIMIT) {
+            /* An exit-walk stall while already ADJACENT (one tile away,
+             * either axis) to the doorway tile hands off directly to
+             * WALK_PHASE_CROSS instead of the generic sidestep/blocked
+             * path below. A doorway's real passable column is a property
+             * of the CROSSING itself, not of the approach tile's own
+             * floor mask -- verified live: room 253's [1,7] door has its
+             * genuine opening well off the tile's geometric center (and
+             * off the mask-validated-open-floor point too), so PATH-phase
+             * approaching it can stall one tile short no matter which
+             * point within the tile it targets, while WALK_PHASE_CROSS's
+             * perpendicular deadband correction (already proven, see its
+             * own header comment) finds and holds the real alignment once
+             * given the chance to try. Only for exit walks (walk_target_x/y
+             * is a real doorway then) and only when adjacency is genuine
+             * (Manhattan tile distance 1) -- otherwise falls through to
+             * the same sidestep/blocked handling every other stall uses. */
+            if (walk_is_exit_target &&
+                (abs((int)tile_x - (int)walk_target_x) +
+                 abs((int)tile_y - (int)walk_target_y)) <= 1) {
+                walk_phase = WALK_PHASE_CROSS;
+                walk_cross_ncand = walk_exit_dir_candidates(walk_target_x, walk_target_y,
+                                                             walk_cross_cand);
+                walk_cross_idx = 0;
+                walk_cross_round = 0;
+                walk_cross_ticks = 0;
+                walk_pump_cross();
+                return;
+            }
             /* A final-waypoint stall on an item walk does NOT get the
              * generic perpendicular-sidestep-then-re-BFS recovery below --
              * that recovery re-paths back to this SAME coarse target tile,
@@ -1817,11 +2420,12 @@ static void walk_pump(void)
             if (!walk_recovered && walk_path_idx < walk_path_len - 1) {
                 /* Non-final-waypoint stall, recovery not used yet:
                  * sidestep perpendicular to the current leg's direction
-                 * of travel. Each BFS step is single-axis (walk_bfs is
-                 * 4-connected), so comparing the waypoint we were heading
-                 * for against our current tile unambiguously tells us
-                 * which axis was "primary" (blocked) and which is
-                 * perpendicular (the way around). */
+                 * of travel. Each BFS step (in the tile path
+                 * walk_path_to_tiles derives from the subcell search) is
+                 * single-axis, so comparing the waypoint tile we were
+                 * heading for against our current tile unambiguously
+                 * tells us which axis was "primary" (blocked) and which
+                 * is perpendicular (the way around). */
                 int16_t wtx = walk_path_x[walk_path_idx];
                 int16_t wty = walk_path_y[walk_path_idx];
                 int16_t wcx = (int16_t)(wtx * 32 + 16);
@@ -1843,7 +2447,7 @@ static void walk_pump(void)
                 walk_stall_ticks = 0;
                 return;
             }
-            walk_cancel(WALK_BLOCKED);
+            walk_set_blocked(walk_classify_stall());
             return;
         }
     } else {
@@ -1896,29 +2500,77 @@ static void walk_pump(void)
 
     target_x = walk_path_x[walk_path_idx];
     target_y = walk_path_y[walk_path_idx];
-    cx = (int16_t)(target_x * 32 + 16);
-    cy = (int16_t)(target_y * 32 + 16);
-
-    if (px < cx - WALK_DEADBAND) {
-        key_down[walk_key_right] = true;
-        key_down[walk_key_left] = false;  key_readonce[walk_key_left] = false;
-    } else if (px > cx + WALK_DEADBAND) {
-        key_down[walk_key_left] = true;
-        key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+    if (walk_path_idx == walk_path_len - 1 && !walk_is_exit_target) {
+        /* Final waypoint of a NON-exit walk: aim at the mask-validated
+         * WALKABLE subcell within this tile (walk_target_sub_x/y), not
+         * the tile's naive geometric center -- see walk_target_sub_x/y's
+         * own header comment for the concrete failure this fixes (a
+         * partially-blocked tile whose real open area isn't centered, so
+         * the plain-center aim point was itself sitting on a wall pixel
+         * and unreachable no matter how PATH-phase steered).
+         *
+         * Exit walks are deliberately excluded: an exit tile's mask
+         * defines its OWN floor, not the doorway's actual through-
+         * passage into the next room, which can require a different
+         * (narrower, specifically-aligned) column than any single point
+         * this tile's own mask validates as "open" -- verified live: a
+         * subcell that passed this tile's mask test sat right next to a
+         * real wall, while the doorway's genuine passable column was
+         * several pixels further over. WALK_PHASE_CROSS already exists
+         * specifically to find and hold that real crossing alignment
+         * (perpendicular deadband correction while pushing outward, see
+         * its own header comment) -- PATH-phase only needs to get
+         * "close enough" to hand off to it, exactly like the pre-Task10
+         * design already proved reliable. */
+        cx = (int16_t)(walk_target_sub_x * SUB_SIZE + SUB_SIZE/2);
+        cy = (int16_t)(walk_target_sub_y * SUB_SIZE + SUB_SIZE/2);
     } else {
-        key_down[walk_key_left] = false;  key_readonce[walk_key_left] = false;
-        key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+        cx = (int16_t)(target_x * 32 + 16);
+        cy = (int16_t)(target_y * 32 + 16);
     }
 
-    if (p2y < cy - WALK_DEADBAND) {
-        key_down[walk_key_down] = true;
-        key_down[walk_key_up] = false;    key_readonce[walk_key_up] = false;
-    } else if (p2y > cy + WALK_DEADBAND) {
-        key_down[walk_key_up] = true;
-        key_down[walk_key_down] = false;  key_readonce[walk_key_down] = false;
-    } else {
-        key_down[walk_key_up] = false;    key_readonce[walk_key_up] = false;
-        key_down[walk_key_down] = false;  key_readonce[walk_key_down] = false;
+    {
+        bool x_out = (px < cx - WALK_DEADBAND) || (px > cx + WALK_DEADBAND);
+        bool y_out = (p2y < cy - WALK_DEADBAND) || (p2y > cy + WALK_DEADBAND);
+        /* Final waypoint only: correct ONE axis at a time (x first, same
+         * priority ITEM_PIXEL uses), not both simultaneously. The engine
+         * rejects a diagonal move atomically if EITHER component axis
+         * would collide (brief, verbatim) -- fine for intermediate
+         * waypoints (mid-tile, both axes usually have a full tile's worth
+         * of open floor either side) but verified live to make a tight
+         * doorway/subcell-precision final approach fail outright: this
+         * exact tile's real (mask-validated) opening needed x and y
+         * corrected in sequence, not at once, even though EACH single
+         * axis, held alone, moves the prisoner fine (confirmed via manual
+         * /input single-key holds from the exact stuck position). Every
+         * other waypoint keeps the original simultaneous-diagonal
+         * steering (main.c's own diagonal motion, "for free" per the
+         * pre-Task10 comment) since it's never needed anything stricter. */
+        bool final_wp = (walk_path_idx == walk_path_len - 1) && !walk_is_exit_target;
+        bool drive_x = x_out;
+        bool drive_y = y_out && (!final_wp || !x_out);
+
+        if (drive_x && px < cx - WALK_DEADBAND) {
+            key_down[walk_key_right] = true;
+            key_down[walk_key_left] = false;  key_readonce[walk_key_left] = false;
+        } else if (drive_x && px > cx + WALK_DEADBAND) {
+            key_down[walk_key_left] = true;
+            key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+        } else {
+            key_down[walk_key_left] = false;  key_readonce[walk_key_left] = false;
+            key_down[walk_key_right] = false; key_readonce[walk_key_right] = false;
+        }
+
+        if (drive_y && p2y < cy - WALK_DEADBAND) {
+            key_down[walk_key_down] = true;
+            key_down[walk_key_up] = false;    key_readonce[walk_key_up] = false;
+        } else if (drive_y && p2y > cy + WALK_DEADBAND) {
+            key_down[walk_key_up] = true;
+            key_down[walk_key_down] = false;  key_readonce[walk_key_down] = false;
+        } else {
+            key_down[walk_key_up] = false;    key_readonce[walk_key_up] = false;
+            key_down[walk_key_down] = false;  key_readonce[walk_key_down] = false;
+        }
     }
 }
 
@@ -1991,7 +2643,7 @@ static void handle_walk(int cfd, const char* body)
 {
     long a = 0, b = 0, exit_idx;
     uint16_t width = 0, height = 0;
-    int16_t sx, sy, tx = 0, ty = 0;
+    int16_t ssx, ssy, stx, sty, tx = 0, ty = 0;
     int snap, path_len = 0;
     bool is_exit_target;
     char item_name[24];
@@ -2003,6 +2655,7 @@ static void handle_walk(int cfd, const char* body)
         const char* p = strstr(body, "\"cancel\"");
         if (p && strstr(p, "true")) {
             walk_cancel(WALK_IDLE);
+            walk_blocked_reason = WALK_BLOCK_NONE;
             send_response(cfd, 200, "application/json", "{\"walking\":false}", 18);
             return;
         }
@@ -2161,14 +2814,25 @@ static void handle_walk(int cfd, const char* body)
         is_exit_target = is_exit_target || walk_grid_isexit[(int)ty*(int)width + tx];
     }
 
-    sx = guybrush[current_nation].px / 32;
-    sy = guybrush[current_nation].p2y / 32;
-    if (sx < 0) sx = 0;
-    if (sy < 0) sy = 0;
-    if (sx >= (int16_t)width)  sx = (int16_t)width  - 1;
-    if (sy >= (int16_t)height) sy = (int16_t)height - 1;
+    /* Task 10: resolve the tile-level target (tx,ty) -- an exit tile, a
+     * plain {"tile":[x,y]} request, or an item's own/approach tile -- down
+     * to a concrete WALKABLE subcell (mask-accurate, not just "this tile
+     * has a nonzero id"), biased toward the TILE'S OWN CENTER in every
+     * case (including item walks -- NOT the item's exact pickup anchor;
+     * see walk_sidestep_finish's matching comment for why: PATH-phase only
+     * needs to reach the general vicinity of the target tile, same as a
+     * plain-tile walk, and hands off to WALK_PHASE_ITEM_PIXEL's dedicated
+     * pixel-precision/corner-rounding machinery for the final approach).
+     * This is what actually fixes the "BFS is tile-blind" weakness: a
+     * partially-furniture-blocked tile no longer routes the prisoner
+     * straight at the blocked part only to discover it via a stall-
+     * recovery cycle -- the mask-accurate grid steers the BFS toward
+     * whichever part of the tile is genuinely open. */
+    walk_sub_clamp_start(&ssx, &ssy);
+    walk_resolve_target_subcell(tx, ty, (int16_t)(tx*32 + 16),
+                                 (int16_t)(ty*32 + 16), &stx, &sty);
 
-    if (!walk_bfs(width, height, sx, sy, tx, ty, &path_len)) {
+    if (!walk_bfs_sub(walk_sub_width, walk_sub_height, ssx, ssy, stx, sty, &path_len)) {
         static const char* nopath = "{\"error\":\"no path\"}";
         send_response(cfd, 409, "application/json", nopath, strlen(nopath));
         return;
@@ -2198,8 +2862,14 @@ static void handle_walk(int cfd, const char* body)
     walk_height = height;
     walk_target_x = tx;
     walk_target_y = ty;
-    walk_start_x = sx;
-    walk_start_y = sy;
+    walk_target_sub_x = stx;
+    walk_target_sub_y = sty;
+    /* walk_start_x/y is walk_exit_dir_candidates' fallback (walk_path_len
+     * < 2) arrival-direction reference, which compares against TILE
+     * waypoints -- must be the start TILE, not the subcell BFS's start
+     * subcell (ssx/ssy) passed to walk_bfs_sub above. */
+    walk_start_x = (int16_t)(ssx / SUB_PER_TILE);
+    walk_start_y = (int16_t)(ssy / SUB_PER_TILE);
     walk_is_exit_target = is_exit_target;
     /* Item-walk state (the /walk item+pickup feature): gates PATH-phase's
      * target-reached handoff into WALK_PHASE_ITEM_PIXEL. Explicitly reset
@@ -2218,6 +2888,7 @@ static void handle_walk(int cfd, const char* body)
     walk_phase = WALK_PHASE_PATH;
     walk_recovered = false;
     walk_total_ticks = 0;
+    walk_blocked_reason = WALK_BLOCK_NONE;
     walk_status = WALK_WALKING;
 
     if (has_item)
