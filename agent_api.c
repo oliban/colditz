@@ -393,11 +393,21 @@ static void handle_input(int cfd, const char* body)
     ms = json_int(body, "ms", 100);
     if (ms < 16) ms = 16;
     if (ms > 10000) ms = 10000;
-    /* A manual key overrides any in-progress walk: cancel it (releasing
-     * the walk-held direction keys) before this key is enqueued, per the
-     * brief -- otherwise the walk's held keys and this queued key would
-     * fight over the same key_down[] state machine. */
-    walk_cancel(WALK_IDLE);
+    /* A manual DIRECTION key overrides any in-progress walk: cancel it
+     * (releasing the walk-held direction keys) before this key is
+     * enqueued -- otherwise the walk's held keys and this queued key
+     * would fight over the same key_down[] state machine. Non-direction
+     * keys (walk_run toggle, pickup/drop, inventory, prisoner select)
+     * don't contend for movement and must NOT cancel the walk: engaging
+     * run-mode mid-walk is the canonical use (the engine only accepts
+     * the walk/run toggle while the prisoner is in a moving animation,
+     * per main.c's KEY_TOGGLE_WALK_RUN handler). NOTE: the queued key
+     * still only fires once the walk's held keys release it -- see
+     * input_pump/walk_pump interplay -- except that input_pump runs
+     * first each tick, so a queued non-direction tap coexists fine. */
+    if (code == KEY_DIRECTION_UP || code == KEY_DIRECTION_DOWN ||
+        code == KEY_DIRECTION_LEFT || code == KEY_DIRECTION_RIGHT)
+        walk_cancel(WALK_IDLE);
     if (!enqueue_key(code, (int)ms)) {
         send_response(cfd, 400, "text/plain", "queue full", 10);
         return;

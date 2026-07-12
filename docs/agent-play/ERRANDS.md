@@ -42,7 +42,7 @@ shown.
 **Direction rule:** `right` = +x, `left` = -x, `down` = +y, `up` = -y
 (origin top-left, same as the `/room` grid's row order).
 
-**Narration:** use `/say` to announce what you're doing at a moment a
+Narration goes to the DASHBOARD via log.sh only. /say is deprecated for runs: the in-game status bar belongs to the game.
 spectator would want to see it (arriving somewhere new, trying a locked
 door, an item pickup, a guard sighting) — not every single step.
 
