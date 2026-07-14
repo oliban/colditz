@@ -1,0 +1,50 @@
+{
+  "items": {
+    "140/lockpick": {"tile": [2, 4], "from": null, "surveyed": "2026-07-14", "note": "plain pickup worked, no approach quirk"},
+    "200/lockpick": {"tile": [2, 3], "from": "s", "approach_tile": [2, 4], "surveyed": "2026-07-14", "note": "must walk to [2,4] first, then pickup with from:s or plain pickup reports blocked/static"}
+  },
+  "doors": {
+    "253:exit0[5,3]": {"locked": true, "opens_with_lockpick": false, "surveyed": "2026-07-14"},
+    "253:exit1[6,3]": {"locked": true, "opens_with_lockpick": false, "surveyed": "2026-07-14"},
+    "253:exit2[1,5]": {"to": 253, "note": "internal, no room change"},
+    "253:exit3[2,5]": {"to": 251, "locked": false, "approach_tile": [1, 5], "surveyed": "2026-07-14"},
+    "253:exit4[5,5]": {"locked": true, "opens_with_lockpick": false, "surveyed": "2026-07-14"},
+    "253:exit5[1,7]": {"to": 254, "locked": false, "approach_tile": [0, 7], "surveyed": "2026-07-11"},
+    "253:exit6[3,7]": {"to": 255, "locked": false, "surveyed": "2026-07-11"},
+    "251:exit0[1,6]": {"to": 253, "locked": false},
+    "254:exit0[0,3]": {"to": 253, "locked": false},
+    "255:exit0[0,4]": {"to": 253, "locked": false},
+    "230:exit0[0,3]": {"locked": true, "surveyed": "2026-07-11"},
+    "230:exit1[1,3]": {"locked": true, "surveyed": "2026-07-11"},
+    "230:exit2[2,5]": {"to": 231, "locked": false},
+    "231:exit0[0,3]": {"to": 230, "locked": false},
+    "231:exit1[1,4]": {"locked": true, "surveyed": "2026-07-11"},
+    "140:exit0[3,6]": {"to": 144, "locked": false, "surveyed": "2026-07-14"},
+    "144:exit0[0,3]": {"locked": true, "danger": "prisoner death observed in this room; treat as lethal-risk not just locked", "surveyed": "2026-07-14"},
+    "144:exit1[1,3]": {"locked": true, "surveyed": "2026-07-14"},
+    "144:exit2[3,5]": {"locked": true, "surveyed": "2026-07-14"},
+    "144:exit3[9,5]": {"locked": true, "surveyed": "2026-07-14"},
+    "144:exit4[7,6]": {"to": 140, "locked": false, "surveyed": "2026-07-14"},
+    "144:exit5[10,6]": {"locked": true, "surveyed": "2026-07-14"},
+    "144:exit6[3,7]": {"locked": true, "surveyed": "2026-07-14"},
+    "144:exit7[9,8]": {"locked": true, "surveyed": "2026-07-14"},
+    "200:exit0[0,6]": {"locked": true, "opens_with_lockpick": false, "surveyed": "2026-07-14"},
+    "200:exit1[2,8]": {"locked": true, "opens_with_lockpick": false, "surveyed": "2026-07-14"},
+    "237:exit0[3,3]": {"locked": true, "surveyed": "2026-07-14"},
+    "237:exit1[2,4]": {"locked": true, "opens_with_lockpick": false, "surveyed": "2026-07-14"},
+    "237:exit2[0,7]": {"locked": true, "surveyed": "2026-07-14", "note": "retried twice, consistently blocked/door"}
+  },
+  "legs": {
+    "british-spawn-to-deadend": ["253 exit 5", "254 (dead end, back) exit 0", "253 exit 6", "255 (dead end, back) exit 0"],
+    "british-251-detour": ["253 tile 1 5", "253 exit 3", "251 (dead end) exit 0"],
+    "french-descent": ["219 exit 1", "224 exit 5", "227 exit 1", "230 exit 2"],
+    "american-item-grab": ["140 item lockpick pickup", "140 exit 0"],
+    "polish-item-grab": ["200 tile 2 4", "200 item lockpick pickup from s"]
+  },
+  "anomalies": {
+    "american-death-room144": {
+      "surveyed": "2026-07-14",
+      "note": "american prisoner found dead:true, state_flags:512, in room 144 after being left idling near locked doors [0,3]. Its picked-up lockpick from room 140 also vanished from inventory before death was noticed. Cause not directly observed (fair play: no memory reads); circumstantial guard activity suspected."
+    }
+  }
+}
