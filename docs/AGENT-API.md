@@ -379,6 +379,37 @@ curl -s -X POST -d '{"door":[5,3],"use":true}' localhost:8765/walk
   {"cancel":true}` still stops it immediately (keys released) at any
   phase.
 
+### `/walk` tailgate mode — camping a door until it opens
+
+```bash
+curl -s -X POST -d '{"tailgate":[5,3],"timeout_s":120}' localhost:8765/walk
+# => {"walking":true,"target":[5,3],"path_len":4,"tailgate":true,"timeout_s":120}
+```
+
+Guards operate locked doors and close them behind themselves; door states
+also follow the castle's daily timetable. A tailgate walk exploits both: it
+is an exit-target walk (same BFS approach + CROSSING push-and-align as a
+`"door"` walk, no `KEY_ACTION` taps) whose CROSSING phase **never gives up
+on its own** — it camps at the doorway, holding the outward push and
+perpendicular alignment, so the instant the door becomes passable (a guard
+opens it, or a scheduled opening arrives) the held push slips through and
+the walk ends `arrived` via the ordinary room-change rule.
+
+- `"tailgate":[x,y]` must name an exit tile of the current room — same 400
+  as door mode otherwise.
+- `"timeout_s"` (default 120, clamped to [5, 600]) replaces the ordinary
+  30s whole-walk cap and bounds **approach + camp together**; expiry ends
+  the walk `blocked`/`"timeout"`. Size it to the risk you accept: idling
+  in a restricted zone can be lethal.
+- `/state` gains a top-level `"tailgating"` boolean: `true` from the first
+  CROSSING tick of a tailgate walk (the camp has actually begun) until the
+  walk ends — poll it to split approach time from guard-wait time.
+- Fair play: no lock/grade byte is ever read; the walk learns the door
+  opened exactly the way a watching human would — the prisoner suddenly
+  goes through.
+- All other termination rules unchanged (prisoner switch, manual `/input`
+  direction key, `{"cancel":true}`).
+
 ## `/control` caveats
 
 - **Pause goes through the real `KEY_PAUSE` binding (F5 by default), not a
