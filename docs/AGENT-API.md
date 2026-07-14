@@ -130,12 +130,14 @@ curl -s -X POST -d '{"cancel":true}' localhost:8765/walk  # => {"walking":false}
 ```
 
 - Takes a target tile (`"tile":[x,y]`, in the current room's own coordinate
-  space) or an exit index (`"exit":N`, resolving to the Nth entry of
+  space), an exit index (`"exit":N`, resolving to the Nth entry of
   `/room`'s own `exits` array — a convenience so a caller doesn't have to
-  round-trip through `/room` just to get a coordinate it already has).
-  `"cancel":true` stops an in-progress walk immediately (keys released, 200
-  `{"walking":false}`); any other `"tile"`/`"exit"` body is ignored once
-  `"cancel"` is present.
+  round-trip through `/room` just to get a coordinate it already has), a
+  door tile (`"door":[x,y],"use":bool` — see the door-use mode section
+  below), or an item name (`"item":"<name>"` — see the item mode section
+  below). `"cancel":true` stops an in-progress walk immediately (keys
+  released, 200 `{"walking":false}`); any other target body is ignored
+  once `"cancel"` is present.
 - Paths with a 4-connected BFS over a **snapshot** of the same visible-floor
   grid `/room` exposes (any nonzero tile id, taken once when the walk is
   accepted), then drives it exactly the way a held keypress would: holding
@@ -307,6 +309,75 @@ curl -s -X POST -d '{"item":"lockpick","pickup":true}' localhost:8765/walk
   applies across pathing + recovery + pixel-steering combined, `/input`
   still cancels an in-progress item walk, and `/walk {"cancel":true}` still
   stops it immediately (keys released) at any phase.
+
+### `/walk` door-use mode — attempting a locked/graded door
+
+```bash
+curl -s -X POST -d '{"door":[5,3],"use":true}' localhost:8765/walk
+# => {"walking":true,"target":[5,3],"path_len":4,"door":true,"use":true}
+```
+
+- `"door":[x,y]` must name an exit/doorway tile of the current room (the
+  same cells `/room`'s grid marks `E`) — 400 `"door target is not an exit
+  tile"` otherwise. This is stricter than plain `"tile"` targeting, which
+  happily accepts any walkable tile; a door-use request that doesn't name
+  an actual doorway is a request-shape error, not a walk that ends
+  `blocked`.
+- Behaves exactly like any other exit-target walk (BFS approach, then the
+  CROSSING phase's outward-push-with-perpendicular-correction, see above)
+  **plus one addition when `"use":true`**: while CROSSING pushes toward
+  and aligns on the doorway's real passable column, it also taps
+  `KEY_ACTION` every ~0.16s (same 100ms hold the item-mode pickup tap
+  uses) for as long as the crossing attempt runs. `"use":false` (or
+  omitted) skips the tap — just an ordinary approach-and-attempt-crossing
+  walk toward a named doorway, useful if the door is already known/expected
+  to be open.
+- **Why this is the fix, not just another approach angle** (the mechanism
+  this mode exists to prove; see `check_footprint()`, `game.c:2170-2339`):
+  the engine's door-unlock branch only ever evaluates inside the
+  `FOOTPRINT_HEIGHT` mask-row scan reached from a **nonzero** `(dx,d2y)`
+  movement attempt (`main.c:472`, `process_motion()`'s real per-tick
+  `check_footprint(dx*prisoner_speed, d2y*prisoner_speed)` call) — never
+  from the stationary `check_footprint(0,0)` the action-tap's tunnel-I/O
+  check uses (`main.c:738`), which returns before ever reaching that scan.
+  In other words: standing still at a locked door and tapping action does
+  nothing, by construction — the unlock attempt has to happen **while
+  pushing a movement key into the door**, in the same tick `is_fire_pressed`
+  is true. CROSSING's existing push-and-perpendicular-align loop already
+  puts a movement key down every tick; door-use mode's only addition is
+  making sure a `KEY_ACTION` tap lands during that same window, repeated
+  through the loop's alignment-converging duration so a tap actually
+  coincides with the correct column instead of firing once before
+  alignment is even close.
+- **Fair play (same mandate as everywhere else `/walk` touches an
+  exit): the lock/grade byte (`exit_flags`, `get_exit_offset()`) is never
+  read by this mode.** A door-use attempt against a door the current
+  prisoner can't open (wrong or no key selected, or a door requiring a
+  grade the current selection doesn't match) simply does nothing — exactly
+  what a human trying the wrong key sees. Accordingly, **a door-use walk
+  that exhausts CROSSING's alignment/round budget with no room change ends
+  `arrived`, not `blocked`** (the one deliberate difference from a plain
+  exit walk, which ends `blocked`/`"door"` in the same situation) — the
+  approach-and-tap sequence itself completed; whether it actually worked
+  is for the caller to determine afterward, the same way a human would:
+  - check `/state`'s `prisoners[n].inventory` prop counts before/after —
+    a matched key is consumed (`consume_prop()`) the instant the door
+    starts opening, even before the crossing animation finishes;
+  - or simply issue a follow-up `/walk {"door":[x,y],"use":false}` (or
+    `{"exit":N}`) and see whether it now completes with an actual room
+    change — an unlocked door stays unlocked.
+  `/walk` deliberately exposes no separate one-shot "did it unlock" field;
+  `/state`'s existing inventory counts already carry this information
+  without adding any lock/grade-shaped surface to the API.
+- If the doorway is already open (or opens mid-attempt), the ordinary
+  room-change-is-`arrived` rule (shared by every walk phase) fires first —
+  a door-use walk against an open door behaves identically to a plain exit
+  walk, just with a few harmless extra `KEY_ACTION` taps along the way.
+- All the ordinary `/walk` termination rules still apply: prisoner switch
+  or room change mid-walk ends it, the whole-walk 30s cap still applies,
+  `/input` still cancels an in-progress door-use walk, and `/walk
+  {"cancel":true}` still stops it immediately (keys released) at any
+  phase.
 
 ## `/control` caveats
 

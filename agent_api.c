@@ -928,6 +928,25 @@ static bool walk_is_item_target = false;
 static bool walk_item_pickup = false;
 static int16_t walk_item_anchor_x = 0, walk_item_anchor_y = 0;
 
+/* True for a door-use walk ({"door":[x,y],"use":true}) -- an exit-target
+ * walk (walk_is_exit_target is also forced true for these, see handle_walk)
+ * with one addition: while WALK_PHASE_CROSS pushes into the doorway and
+ * perpendicular-deadband-corrects onto its real passable column (exactly
+ * the positioning check_footprint's own exit-mask collision test needs --
+ * see game.c:2170-2339, and in particular that the door-unlock branch only
+ * evaluates on a NONZERO (dx,d2y) move, i.e. while actually pushing into
+ * the tile, never on the (0,0) stationary check main.c's action-tap uses
+ * for tunnel I/O), it also periodically taps KEY_ACTION (see
+ * WALK_DOOR_TAP_INTERVAL below) so some tick's is_fire_pressed coincides
+ * with the correct alignment. Whether that tap actually had a key that
+ * matched the door's grade is deliberately never read back here (fair
+ * play, same mandate as /room's item block): a door-use walk that
+ * exhausts CROSSING's round budget is reported ARRIVED, not BLOCKED --
+ * see walk_pump_cross's giving-up branch -- exactly what a human trying
+ * the wrong key would see (nothing happens), leaving prop-count/crossing
+ * verification to the caller via /state. */
+static bool walk_door_use = false;
+
 /* ITEM_PIXEL phase's per-axis progress tracker (ordinary, non-rounding
  * steering): tracks the best (smallest) distance-to-target seen on
  * whichever axis is currently "primary" (the one being actively steered,
@@ -1124,6 +1143,19 @@ typedef enum { WALK_DIR_UP, WALK_DIR_DOWN, WALK_DIR_LEFT, WALK_DIR_RIGHT } walk_
  * walk_exit_dir_candidates), alternated a bounded number of rounds. */
 #define WALK_CROSS_LEG_TICKS 50   /* ~0.8s per candidate direction */
 #define WALK_CROSS_MAX_ROUNDS 2
+
+/* Door-use tap cadence (walk_door_use, see its header comment): a short
+ * KEY_ACTION pulse -- same 100ms hold the proven item-pickup tap uses
+ * (walk_pump_item_pixel's enqueue_key(KEY_INVENTORY_PICKUP,100) call) --
+ * fired every WALK_DOOR_TAP_INTERVAL ticks throughout each CROSSING leg,
+ * so several attempts land while the perpendicular correction is
+ * converging on/holding the doorway's real passable column, not just once
+ * at the leg's start before alignment is even close. Routed through the
+ * shared input queue (enqueue_key/input_pump), exactly like a manual
+ * POST /input action tap -- never touches key_down[KEY_ACTION] directly,
+ * so it can't fight input_pump's own one-key-at-a-time bookkeeping. */
+#define WALK_DOOR_TAP_INTERVAL 10   /* ~0.16s between taps */
+#define WALK_DOOR_TAP_MS 100
 static walk_dir_t walk_cross_cand[2];
 static int walk_cross_ncand = 0;
 static int walk_cross_idx = 0;
@@ -1897,12 +1929,37 @@ static void walk_pump_cross(void)
                  * the brief regardless of what walk_classify_stall() would
                  * otherwise guess (a guard could ALSO be blocking the
                  * doorway, but the phase itself is the more specific,
-                 * more useful signal here). */
-                walk_set_blocked(WALK_BLOCK_DOOR);
+                 * more useful signal here).
+                 *
+                 * Door-use walks are the deliberate exception (fair play,
+                 * see walk_door_use's header comment): a locked door with
+                 * no/wrong key selected never opens no matter how well
+                 * aligned or how many taps land, and that's exactly the
+                 * outcome a human trying the wrong key would see -- nothing
+                 * happens, not an error. So this is ARRIVED (the approach
+                 * + tap sequence completed) rather than BLOCKED; the caller
+                 * checks /state's prop counts or attempts a subsequent
+                 * crossing to learn whether it actually worked. */
+                if (walk_door_use)
+                    walk_cancel(WALK_ARRIVED);
+                else
+                    walk_set_blocked(WALK_BLOCK_DOOR);
                 return;
             }
         }
     }
+
+    /* Door-use tap (walk_door_use, see its and WALK_DOOR_TAP_INTERVAL's
+     * header comments): fired on the leg's very first tick (walk_cross_ticks
+     * == 1 right after the ++ above, whether this is a fresh CROSS entry or
+     * a rollover to the next candidate/round) and every WALK_DOOR_TAP_INTERVAL
+     * ticks after, so multiple attempts land while the perpendicular
+     * correction below converges on the doorway's real passable column.
+     * enqueue_key's own bool return is ignored -- a momentarily-full input
+     * queue just costs this one attempt, not the walk; the next interval
+     * retries. */
+    if (walk_door_use && (walk_cross_ticks % WALK_DOOR_TAP_INTERVAL) == 1)
+        enqueue_key(KEY_ACTION, WALK_DOOR_TAP_MS);
 
     d   = walk_cross_cand[walk_cross_idx];
     px  = guybrush[current_nation].px;
@@ -2683,6 +2740,7 @@ static void handle_walk(int cfd, const char* body)
     char item_name[24];
     bool has_item = false, item_pickup = false;
     int16_t item_anchor_x = 0, item_anchor_y = 0;
+    bool has_door = false, door_use = false;
     char resp[96]; int n;
 
     if (body) {
@@ -2703,6 +2761,11 @@ static void handle_walk(int cfd, const char* body)
 
     has_item = body && json_str(body, "item", item_name, sizeof(item_name));
     exit_idx = (!has_item && body) ? json_int(body, "exit", -1) : -1;
+    has_door = (!has_item && exit_idx < 0 && body) ? json_intpair(body, "door", &a, &b) : false;
+    if (has_door) {
+        const char* p = strstr(body, "\"use\"");
+        door_use = p && strstr(p, "true");
+    }
 
     if (has_item) {
         uint16_t room = guybrush[current_nation].room;
@@ -2802,13 +2865,27 @@ static void handle_walk(int cfd, const char* body)
     } else if (exit_idx >= 0) {
         snap = walk_snapshot_grid(&width, &height, (int)exit_idx, &tx, &ty);
         is_exit_target = true;
+    } else if (has_door) {
+        /* {"door":[x,y],"use":bool}: pixel-approach an exit tile of the
+         * current room, same target-resolution/BFS machinery as any other
+         * exit walk (is_exit_target forced true here rather than "refined
+         * below" like the plain {"tile":[x,y]} branch -- a door request
+         * that DOESN'T land on an exit cell is a request error, not a
+         * silent fallback to a plain-tile walk, see the explicit check
+         * below). walk_door_use (set further down, alongside the other
+         * per-walk-type resets) gates whether WALK_PHASE_CROSS also taps
+         * KEY_ACTION while it pushes/aligns -- see its header comment. */
+        snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
+        tx = (int16_t)a; ty = (int16_t)b;
+        is_exit_target = true;
     } else if (body && json_intpair(body, "tile", &a, &b)) {
         snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
         tx = (int16_t)a; ty = (int16_t)b;
         is_exit_target = false;    /* refined below once walk_grid_isexit is known */
     } else {
         static const char* need =
-            "expected \"tile\":[x,y], \"exit\":N, or \"item\":\"name\"";
+            "expected \"tile\":[x,y], \"exit\":N, \"item\":\"name\", or "
+            "\"door\":[x,y]";
         send_response(cfd, 400, "text/plain", need, strlen(need));
         return;
     }
@@ -2837,6 +2914,16 @@ static void handle_walk(int cfd, const char* body)
         if (!walk_grid_walkable[(int)ty*(int)width + tx]) {
             static const char* voidtile = "target is void tile";
             send_response(cfd, 400, "text/plain", voidtile, strlen(voidtile));
+            return;
+        }
+
+        /* A {"door":[x,y]} request specifically must land on an exit cell
+         * -- unlike a plain {"tile":[x,y]} walk, which happily accepts a
+         * non-exit walkable tile, a door-use request that names a tile
+         * that isn't a doorway at all is a request-shape error. */
+        if (has_door && !walk_grid_isexit[(int)ty*(int)width + tx]) {
+            static const char* notdoor = "door target is not an exit tile";
+            send_response(cfd, 400, "text/plain", notdoor, strlen(notdoor));
             return;
         }
 
@@ -2919,6 +3006,11 @@ static void handle_walk(int cfd, const char* body)
     walk_item_round = 0;
     walk_item_rounding = false;
     walk_item_round_sidestepping = false;
+    /* Door-use state (the /walk door-use feature): gates WALK_PHASE_CROSS's
+     * periodic KEY_ACTION tap and its exhausted-rounds -> ARRIVED (not
+     * BLOCKED) outcome. Explicitly reset false for every non-door walk
+     * too, same pattern as walk_is_item_target above. */
+    walk_door_use = has_door && door_use;
     walk_phase = WALK_PHASE_PATH;
     walk_recovery_count = 0;
     walk_total_ticks = 0;
@@ -2930,6 +3022,11 @@ static void handle_walk(int cfd, const char* body)
                      "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d,"
                      "\"item\":\"%s\"}",
                      (int)tx, (int)ty, path_len, item_name);
+    else if (has_door)
+        n = snprintf(resp, sizeof(resp),
+                     "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d,"
+                     "\"door\":true,\"use\":%s}",
+                     (int)tx, (int)ty, path_len, walk_door_use ? "true" : "false");
     else
         n = snprintf(resp, sizeof(resp),
                      "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d}",

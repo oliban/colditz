@@ -161,6 +161,58 @@ CODE=$(curl -s -o /tmp/walk_zeppelin.json -w '%{http_code}' -X POST -d '{"item":
 curl -s -X POST -d '{"key":"down","ms":600}' http://127.0.0.1:$PORT/input > /dev/null
 sleep 1
 
+# 9e. /walk door-use mode: request-shape validation only -- NOT asserting
+# an actual unlock (guard-timing/door-grade dependent, would be flaky in
+# CI; the empirical unlock proof lives in the task report, not here). A
+# door target that isn't an exit/doorway cell must 400; a door target that
+# IS an exit cell must 202 -- then immediately cancelled so it can't
+# interfere with test 10's own exit-crossing walk right after this.
+ROOMJSON2=$(curl -s http://127.0.0.1:$PORT/room)
+DOOR_TILE=$(echo "$ROOMJSON2" | python3 -c "
+import json,sys
+r = json.load(sys.stdin)
+for y, row in enumerate(r['grid']):
+    for x, c in enumerate(row):
+        if c == 'E':
+            print(f'{x},{y}'); sys.exit()
+")
+NONDOOR_TILE=$(echo "$ROOMJSON2" | python3 -c "
+import json,sys
+r = json.load(sys.stdin)
+tx, ty = r['my_tile']
+for y, row in enumerate(r['grid']):
+    for x, c in enumerate(row):
+        if c == '.' and (x, y) != (tx, ty):
+            print(f'{x},{y}'); sys.exit()
+")
+if [ -n "$NONDOOR_TILE" ]; then
+  CODE=$(curl -s -o /tmp/walk_door_bad.json -w '%{http_code}' -X POST \
+    -d "{\"door\":[${NONDOOR_TILE%,*},${NONDOOR_TILE#*,}],\"use\":true}" http://127.0.0.1:$PORT/walk)
+  [ "$CODE" = "400" ] && pass "/walk door on non-exit tile 400s" \
+    || fail "/walk door non-exit returned $CODE: $(cat /tmp/walk_door_bad.json)"
+else
+  fail "/walk door test: no plain floor tile found for the non-exit case"
+fi
+if [ -n "$DOOR_TILE" ]; then
+  for i in $(seq 1 20); do
+    Q=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['input_queue'])")
+    [ "$Q" = "0" ] && break
+    sleep 0.2
+  done
+  CODE=$(curl -s -o /tmp/walk_door_ok.json -w '%{http_code}' -X POST \
+    -d "{\"door\":[${DOOR_TILE%,*},${DOOR_TILE#*,}],\"use\":true}" http://127.0.0.1:$PORT/walk)
+  [ "$CODE" = "202" ] && pass "/walk door on exit tile accepted" \
+    || fail "/walk door valid returned $CODE: $(cat /tmp/walk_door_ok.json)"
+  curl -s -o /dev/null -X POST -d '{"cancel":true}' http://127.0.0.1:$PORT/walk
+  for i in $(seq 1 20); do
+    W=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['walk'])")
+    [ "$W" = "idle" ] && break
+    sleep 0.2
+  done
+else
+  fail "/walk door test: no exit tile found in room"
+fi
+
 # 10. /walk-through exit: from the fresh-start room, POST {"exit":0} must
 # end with status "arrived" AND an actual room change in ONE call -- no
 # manual follow-up nudge (replaces the old threshold-arrival contract).
