@@ -270,6 +270,25 @@ static const char* walk_blocked_reason_name(walk_blocked_reason_t r)
     }
 }
 
+/* Tailgate walk ({"tailgate":[x,y],"timeout_s":N}) flags, declared early
+ * (with walk_status above) because handle_state serializes
+ * walk_tailgate_camping and walk_cancel() resets it; the full feature
+ * lives with the other walk machinery further down. A tailgate walk is an
+ * exit-target walk whose CROSSING phase never gives up on its own: it
+ * camps at the doorway, pushing into it, until the room changes (a
+ * patrolling guard opened the door -- LESSONS.md mechanic 4 -- and the
+ * push slipped through behind him) or the whole-walk deadline
+ * (walk_tailgate_deadline_ticks, from the request's timeout_s) expires.
+ * Fair play: nothing about the door's lock state is ever read; the walk
+ * learns the door opened the exact way a watching human would -- the
+ * prisoner suddenly goes through. walk_tailgate_camping turns true the
+ * first tick the CROSS phase runs (the camp has actually begun, approach
+ * complete) and is what /state reports as "tailgating", so a caller can
+ * split approach time from guard-wait time. */
+static bool walk_tailgate = false;
+static bool walk_tailgate_camping = false;
+static int walk_tailgate_deadline_ticks = 0;
+
 /* Direction key codes resolved once at walk start (conf.h KEYVAL bindings
  * don't change mid-game, so caching avoids re-resolving them every tick --
  * see input_pump, which re-resolves per /input request instead since that
@@ -301,6 +320,7 @@ static void walk_cancel(walk_status_t new_status)
     if (walk_status == WALK_WALKING)
         walk_release_keys();
     walk_status = new_status;
+    walk_tailgate_camping = false;
 }
 
 #define INPUT_QUEUE_LEN 32
@@ -589,10 +609,12 @@ static void handle_state(int cfd)
         n += json_prisoner(json+n, sizeof(json)-(size_t)n, i);
     }
     n = json_append(json, sizeof(json), n,
-                     "],\"message\":\"%s\",\"walk\":\"%s\",\"walk_blocked_reason\":%s}",
+                     "],\"message\":\"%s\",\"walk\":\"%s\",\"walk_blocked_reason\":%s,"
+                     "\"tailgating\":%s}",
                      agent_status_message(), walk_status_name(walk_status),
                      (walk_status == WALK_BLOCKED)
-                         ? walk_blocked_reason_name(walk_blocked_reason) : "null");
+                         ? walk_blocked_reason_name(walk_blocked_reason) : "null",
+                     walk_tailgate_camping ? "true" : "false");
     send_response(cfd, 200, "application/json", json, (size_t)n);
 }
 
@@ -1915,6 +1937,13 @@ static void walk_pump_cross(void)
     int16_t px, p2y, cx, cy;
     walk_dir_t d;
 
+    /* Tailgate camp officially begins the first tick the CROSS phase runs
+     * (approach is over, we are at the doorway pushing) -- surfaces as
+     * /state's "tailgating":true so callers can split approach time from
+     * guard-wait time. Cleared by walk_cancel() on every termination. */
+    if (walk_tailgate)
+        walk_tailgate_camping = true;
+
     walk_cross_ticks++;
     if (walk_cross_ticks >= WALK_CROSS_LEG_TICKS) {
         walk_cross_ticks = 0;
@@ -1923,28 +1952,38 @@ static void walk_pump_cross(void)
             walk_cross_idx = 0;
             walk_cross_round++;
             if (walk_cross_round >= WALK_CROSS_MAX_ROUNDS) {
-                /* Every candidate outward direction exhausted its leg
-                 * budget with no room change -- Task 10 part B: this is
-                 * definitionally the CROSS phase giving up, so "door" per
-                 * the brief regardless of what walk_classify_stall() would
-                 * otherwise guess (a guard could ALSO be blocking the
-                 * doorway, but the phase itself is the more specific,
-                 * more useful signal here).
-                 *
-                 * Door-use walks are the deliberate exception (fair play,
-                 * see walk_door_use's header comment): a locked door with
-                 * no/wrong key selected never opens no matter how well
-                 * aligned or how many taps land, and that's exactly the
-                 * outcome a human trying the wrong key would see -- nothing
-                 * happens, not an error. So this is ARRIVED (the approach
-                 * + tap sequence completed) rather than BLOCKED; the caller
-                 * checks /state's prop counts or attempts a subsequent
-                 * crossing to learn whether it actually worked. */
-                if (walk_door_use)
-                    walk_cancel(WALK_ARRIVED);
-                else
-                    walk_set_blocked(WALK_BLOCK_DOOR);
-                return;
+                /* Tailgate walks never give up here -- camping IS the
+                 * feature. Reset the round counter and keep pushing/
+                 * aligning; the only exits are the shared preamble's
+                 * room-change (success -- the guard opened the door and
+                 * the held push slipped through) and the whole-walk
+                 * tailgate deadline in walk_pump (blocked/timeout). */
+                if (walk_tailgate) {
+                    walk_cross_round = 0;
+                } else {
+                    /* Every candidate outward direction exhausted its leg
+                     * budget with no room change -- Task 10 part B: this is
+                     * definitionally the CROSS phase giving up, so "door" per
+                     * the brief regardless of what walk_classify_stall() would
+                     * otherwise guess (a guard could ALSO be blocking the
+                     * doorway, but the phase itself is the more specific,
+                     * more useful signal here).
+                     *
+                     * Door-use walks are the deliberate exception (fair play,
+                     * see walk_door_use's header comment): a locked door with
+                     * no/wrong key selected never opens no matter how well
+                     * aligned or how many taps land, and that's exactly the
+                     * outcome a human trying the wrong key would see -- nothing
+                     * happens, not an error. So this is ARRIVED (the approach
+                     * + tap sequence completed) rather than BLOCKED; the caller
+                     * checks /state's prop counts or attempts a subsequent
+                     * crossing to learn whether it actually worked. */
+                    if (walk_door_use)
+                        walk_cancel(WALK_ARRIVED);
+                    else
+                        walk_set_blocked(WALK_BLOCK_DOOR);
+                    return;
+                }
             }
         }
     }
@@ -2426,8 +2465,15 @@ static void walk_pump(void)
      * sidestep-recovery attempt + crossing all taking their maximum time
      * in sequence, protecting against any pathological loop. Always
      * "timeout" regardless of which phase it interrupted -- the 30s cap is
-     * its own distinct, unambiguous cause. */
-    if (++walk_total_ticks > WALK_MAX_TICKS) { walk_set_blocked(WALK_BLOCK_TIMEOUT); return; }
+     * its own distinct, unambiguous cause. A tailgate walk substitutes its
+     * own (much longer, request-supplied) deadline for the 30s cap -- the
+     * whole point is to wait at the door for a guard, and timeout_s bounds
+     * approach + camp together (see walk_tailgate's header comment). */
+    if (++walk_total_ticks >
+        (walk_tailgate ? walk_tailgate_deadline_ticks : WALK_MAX_TICKS)) {
+        walk_set_blocked(WALK_BLOCK_TIMEOUT);
+        return;
+    }
 
     /* Room change is success on every phase -- the walk got the prisoner
      * out of the room. This doubles as the CROSSING phase's actual
@@ -2741,7 +2787,9 @@ static void handle_walk(int cfd, const char* body)
     bool has_item = false, item_pickup = false;
     int16_t item_anchor_x = 0, item_anchor_y = 0;
     bool has_door = false, door_use = false;
-    char resp[96]; int n;
+    bool has_tailgate = false;
+    long tailgate_timeout_s = 0;
+    char resp[112]; int n;
 
     if (body) {
         const char* p = strstr(body, "\"cancel\"");
@@ -2765,6 +2813,20 @@ static void handle_walk(int cfd, const char* body)
     if (has_door) {
         const char* p = strstr(body, "\"use\"");
         door_use = p && strstr(p, "true");
+    }
+    /* {"tailgate":[x,y],"timeout_s":N}: camp the named exit tile until a
+     * guard opens it (see walk_tailgate's header comment). timeout_s
+     * bounds the WHOLE walk (approach + camp); clamped to [5,600] --
+     * default 120s comfortably covers the guard patrol cadence observed
+     * live at room 253's east door without letting a typo park a
+     * prisoner forever (idling can be lethal, LESSONS.md mechanic 6:
+     * the caller should size the timeout to the risk it accepts). */
+    has_tailgate = (!has_item && exit_idx < 0 && !has_door && body)
+                       ? json_intpair(body, "tailgate", &a, &b) : false;
+    if (has_tailgate) {
+        tailgate_timeout_s = json_int(body, "timeout_s", 120);
+        if (tailgate_timeout_s < 5)   tailgate_timeout_s = 5;
+        if (tailgate_timeout_s > 600) tailgate_timeout_s = 600;
     }
 
     if (has_item) {
@@ -2878,14 +2940,23 @@ static void handle_walk(int cfd, const char* body)
         snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
         tx = (int16_t)a; ty = (int16_t)b;
         is_exit_target = true;
+    } else if (has_tailgate) {
+        /* Same target resolution as a door-use walk: the named tile must
+         * be an exit cell of the current room (checked below alongside
+         * has_door), and the walk is an exit-target walk so PATH-phase
+         * hands off to the CROSS phase's push-and-align machinery --
+         * which walk_tailgate then keeps alive until deadline. */
+        snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
+        tx = (int16_t)a; ty = (int16_t)b;
+        is_exit_target = true;
     } else if (body && json_intpair(body, "tile", &a, &b)) {
         snap = walk_snapshot_grid(&width, &height, -1, NULL, NULL);
         tx = (int16_t)a; ty = (int16_t)b;
         is_exit_target = false;    /* refined below once walk_grid_isexit is known */
     } else {
         static const char* need =
-            "expected \"tile\":[x,y], \"exit\":N, \"item\":\"name\", or "
-            "\"door\":[x,y]";
+            "expected \"tile\":[x,y], \"exit\":N, \"item\":\"name\", "
+            "\"door\":[x,y], or \"tailgate\":[x,y]";
         send_response(cfd, 400, "text/plain", need, strlen(need));
         return;
     }
@@ -2921,7 +2992,7 @@ static void handle_walk(int cfd, const char* body)
          * -- unlike a plain {"tile":[x,y]} walk, which happily accepts a
          * non-exit walkable tile, a door-use request that names a tile
          * that isn't a doorway at all is a request-shape error. */
-        if (has_door && !walk_grid_isexit[(int)ty*(int)width + tx]) {
+        if ((has_door || has_tailgate) && !walk_grid_isexit[(int)ty*(int)width + tx]) {
             static const char* notdoor = "door target is not an exit tile";
             send_response(cfd, 400, "text/plain", notdoor, strlen(notdoor));
             return;
@@ -3011,6 +3082,14 @@ static void handle_walk(int cfd, const char* body)
      * BLOCKED) outcome. Explicitly reset false for every non-door walk
      * too, same pattern as walk_is_item_target above. */
     walk_door_use = has_door && door_use;
+    /* Tailgate state (see walk_tailgate's header comment): gates the CROSS
+     * phase's never-give-up camping and swaps the 30s whole-walk cap for
+     * the request's own deadline. Explicitly reset for every non-tailgate
+     * walk too, same pattern as the other per-walk-type flags above. */
+    walk_tailgate = has_tailgate;
+    walk_tailgate_camping = false;
+    walk_tailgate_deadline_ticks = has_tailgate
+        ? (int)(tailgate_timeout_s * 1000 / 16) : 0;
     walk_phase = WALK_PHASE_PATH;
     walk_recovery_count = 0;
     walk_total_ticks = 0;
@@ -3027,6 +3106,11 @@ static void handle_walk(int cfd, const char* body)
                      "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d,"
                      "\"door\":true,\"use\":%s}",
                      (int)tx, (int)ty, path_len, walk_door_use ? "true" : "false");
+    else if (has_tailgate)
+        n = snprintf(resp, sizeof(resp),
+                     "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d,"
+                     "\"tailgate\":true,\"timeout_s\":%ld}",
+                     (int)tx, (int)ty, path_len, tailgate_timeout_s);
     else
         n = snprintf(resp, sizeof(resp),
                      "{\"walking\":true,\"target\":[%d,%d],\"path_len\":%d}",

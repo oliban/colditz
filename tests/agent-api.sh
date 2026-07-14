@@ -213,6 +213,44 @@ else
   fail "/walk door test: no exit tile found in room"
 fi
 
+# 9f. /walk tailgate mode: request-shape validation only -- NOT asserting
+# an actual guard-opened crossing (guard patrol timing, minutes-scale,
+# would be hopelessly flaky here; the empirical proof is a live campaign
+# run). A tailgate target that isn't an exit cell must 400; one that IS
+# must 202 with "tailgate":true and the clamped timeout_s echoed back;
+# /state must carry the "tailgating" boolean. Cancelled immediately, same
+# hygiene as 9e.
+if [ -n "$NONDOOR_TILE" ]; then
+  CODE=$(curl -s -o /tmp/walk_tg_bad.json -w '%{http_code}' -X POST \
+    -d "{\"tailgate\":[${NONDOOR_TILE%,*},${NONDOOR_TILE#*,}]}" http://127.0.0.1:$PORT/walk)
+  [ "$CODE" = "400" ] && pass "/walk tailgate on non-exit tile 400s" \
+    || fail "/walk tailgate non-exit returned $CODE: $(cat /tmp/walk_tg_bad.json)"
+fi
+if [ -n "$DOOR_TILE" ]; then
+  CODE=$(curl -s -o /tmp/walk_tg_ok.json -w '%{http_code}' -X POST \
+    -d "{\"tailgate\":[${DOOR_TILE%,*},${DOOR_TILE#*,}],\"timeout_s\":2}" http://127.0.0.1:$PORT/walk)
+  OK=$(python3 -c "
+import json
+r = json.load(open('/tmp/walk_tg_ok.json'))
+print('yes' if r.get('tailgate') is True and r.get('timeout_s') == 5 else 'no')
+" 2>/dev/null)
+  [ "$CODE" = "202" ] && [ "$OK" = "yes" ] \
+    && pass "/walk tailgate on exit tile accepted (timeout clamped to 5)" \
+    || fail "/walk tailgate valid returned $CODE: $(cat /tmp/walk_tg_ok.json)"
+  TG=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "
+import json,sys
+s = json.load(sys.stdin)
+print('yes' if isinstance(s.get('tailgating'), bool) else 'no')")
+  [ "$TG" = "yes" ] && pass "/state has tailgating boolean" \
+    || fail "/state missing/mistyped tailgating field"
+  curl -s -o /dev/null -X POST -d '{"cancel":true}' http://127.0.0.1:$PORT/walk
+  for i in $(seq 1 20); do
+    W=$(curl -s http://127.0.0.1:$PORT/state | python3 -c "import json,sys; print(json.load(sys.stdin)['walk'])")
+    [ "$W" = "idle" ] && break
+    sleep 0.2
+  done
+fi
+
 # 10. /walk-through exit: from the fresh-start room, POST {"exit":0} must
 # end with status "arrived" AND an actual room change in ONE call -- no
 # manual follow-up nudge (replaces the old threshold-arrival contract).
