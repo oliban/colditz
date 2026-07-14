@@ -447,8 +447,30 @@ static void handle_input(int cfd, const char* body)
  * See docs/AGENT-API.md for the resulting display caveat. */
 static void handle_control(int cfd, const char* body)
 {
-    static const char* need_pause = "expected \"pause\"";
+    static const char* need_pause = "expected \"pause\" or \"prisoner\"";
     char resp[48]; int n; const char* p; bool want;
+    /* {"prisoner":N} (0-3): deterministic prisoner switch via the
+     * engine's own switch_nation() (game.c:2535), replacing the racy
+     * KEY_PRISONER_* tap path: an injected key can be missed while the
+     * input queue is busy or a walk is being superseded, which cost
+     * several live incidents of commands running as the WRONG prisoner
+     * (walks fired into other rooms' walls, one near-arrest). Calling
+     * switch_nation() directly from the API tick is exactly what
+     * main.c's own key handler does (main.c:604), minus the keyboard. */
+    if (body && (p = strstr(body, "\"prisoner\"")) != NULL) {
+        long want_n = json_int(body, "prisoner", -1);
+        if (want_n < 0 || want_n >= NB_NATIONS) {
+            send_response(cfd, 400, "text/plain", "prisoner must be 0-3", 20);
+            return;
+        }
+        if ((uint8_t)want_n != current_nation) {
+            walk_cancel(WALK_IDLE);   /* a fresh nation invalidates any walk */
+            switch_nation((uint8_t)want_n);
+        }
+        n = snprintf(resp, sizeof(resp), "{\"prisoner\":%d}", (int)want_n);
+        send_response(cfd, 200, "application/json", resp, (size_t)n);
+        return;
+    }
     if (!body || !(p = strstr(body, "\"pause\""))) {
         send_response(cfd, 400, "text/plain", need_pause, strlen(need_pause));
         return;
@@ -1144,6 +1166,12 @@ static walk_phase_t walk_phase = WALK_PHASE_PATH;
  * chaining detaches. */
 #define WALK_DETACH_TICKS 22   /* ~0.35s of continued push past the doorway */
 static int walk_detach_ticks_left = 0;
+/* Per-walk opt-out ({"detach":false}): at doorway CLUSTERS the tail can
+ * chain straight through a second adjacent doorway (live: 251's exit
+ * detaches through 253's [1,7] into stairwell 250 -- twice an arrest
+ * trap during forbidden hours). Callers who know they're crossing into
+ * a cluster can disable the tail and manage the mouth themselves. */
+static bool walk_do_detach = true;
 /* walk_detach_dir lives further down, after walk_dir_t's own typedef. */
 
 /* Recovery-attempt budget per whole walk (part B); reset in handle_walk.
@@ -2540,7 +2568,7 @@ static void walk_pump(void)
      * other phase (or a second change during the tail) ends the walk
      * arrived as before. */
     if (guybrush[current_nation].room != walk_room) {
-        if (walk_phase == WALK_PHASE_CROSS) {
+        if (walk_phase == WALK_PHASE_CROSS && walk_do_detach) {
             walk_room = guybrush[current_nation].room;
             walk_detach_dir = walk_cross_cand[walk_cross_idx];
             walk_detach_ticks_left = WALK_DETACH_TICKS;
@@ -3184,6 +3212,12 @@ static void handle_walk(int cfd, const char* body)
     {
         const char* rp = body ? strstr(body, "\"run\"") : NULL;
         walk_auto_run = !(rp && strstr(rp, "false"));
+    }
+    /* Post-crossing detach tail: on unless "detach":false (see
+     * walk_do_detach's header comment for the doorway-cluster case). */
+    {
+        const char* dp = body ? strstr(body, "\"detach\"") : NULL;
+        walk_do_detach = !(dp && strstr(dp, "false"));
     }
     walk_run_kick_ticks = 0;
     walk_phase = WALK_PHASE_PATH;
