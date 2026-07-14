@@ -67,3 +67,27 @@ agent API or on-screen observation — no source-mined game strategy.
   lock grades/door states = discoverable only by trying; no source
   strategy mining. It made every discovery feel earned and kept the
   campaign honest.
+
+## The castle's daily rhythm (decoded 2026-07-14, session 2)
+
+9. **Zone legality is time-of-day**: OPEN ACCESS corridors are FORBIDDEN
+   until mid-morning (~10:15 game clock) and after evening curfew. The
+   prison-bars icon on a prisoner's PORTRAIT means "currently in a
+   forbidden zone" — the on-screen tell to retreat. Being caught there =
+   arrest, solitary (~5-15 min wall), all items confiscated (gone).
+10. **Locks vs leaves vs sentries**: permanent locks need a consumed tool
+   (lockpick/key1/key2; door then open forever). Unlocked doors have
+   LEAVES guards open/close as they pass — a closed leaf blocks like a
+   lock but silently. Sentries body-block open doorways ("waiting on the
+   other side"). Screenshot tells them apart: visible brown leaf =
+   closed; dark passage + blocked = sentry (possibly far-side).
+11. **Doorway clusters chain**: the post-crossing detach tail can carry a
+   prisoner through a SECOND adjacent doorway (251->253->250). Usually a
+   free bonus, occasionally a trap (250 was a guard zone pre-legal-hour).
+12. **Stash discipline is mandatory**: drop items in a safe single-exit
+   room before probing unknown doors. Confiscation is total and
+   permanent (per boot). Solitary cells so far: 70, 18, 73.
+13. **Boot-scoped RNG**: sentry posts and patrol routes differ per boot;
+   resets re-roll them. Reset-lottery + morning-asset-blitz + legal-hour
+   push + timetable probing is the working campaign loop (see
+   campaign/blitz.sh, rotate.sh, prober.sh).
