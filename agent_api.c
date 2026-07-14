@@ -1124,9 +1124,27 @@ static int walk_stall_ticks = 0;
  * ITEM_PIXEL. */
 typedef enum {
     WALK_PHASE_PATH, WALK_PHASE_CROSS, WALK_PHASE_SIDESTEP,
-    WALK_PHASE_ITEM_PIXEL
+    WALK_PHASE_ITEM_PIXEL, WALK_PHASE_DETACH
 } walk_phase_t;
 static walk_phase_t walk_phase = WALK_PHASE_PATH;
+
+/* Post-crossing detach (WALK_PHASE_DETACH): a doorway crossing drops the
+ * prisoner INSIDE the door's exit-mask zone, where the very next move
+ * along the crossing axis re-triggers the transition straight back --
+ * live-verified repeatedly (253<->251, 144<->142, 144<->140, 204<->202:
+ * the "door-mouth bounce" that cost manual perpendicular nudges after
+ * every crossing, each door needing its own discovered direction). Fix at
+ * the source: when the CROSS phase detects its room change, keep holding
+ * the SAME outward direction for a short fixed tail so the prisoner walks
+ * clear of the mask zone before the walk reports arrived. Continuing the
+ * crossing direction is always safe -- it moves deeper into the new room,
+ * and if furniture sits right behind the door the held key just pushes
+ * harmlessly (no movement, no re-cross). A second room change during the
+ * tail (unexpected) ends the walk arrived immediately rather than
+ * chaining detaches. */
+#define WALK_DETACH_TICKS 22   /* ~0.35s of continued push past the doorway */
+static int walk_detach_ticks_left = 0;
+/* walk_detach_dir lives further down, after walk_dir_t's own typedef. */
 
 /* Recovery-attempt budget per whole walk (part B); reset in handle_walk.
  * Originally a one-shot bool ("one recovery attempt per walk," per the
@@ -1160,6 +1178,10 @@ static int walk_total_ticks = 0;
 /* Cardinal direction, used by both the CROSSING and SIDESTEP phases to
  * name which single key is held. */
 typedef enum { WALK_DIR_UP, WALK_DIR_DOWN, WALK_DIR_LEFT, WALK_DIR_RIGHT } walk_dir_t;
+
+/* Direction held by the post-crossing detach tail (see WALK_PHASE_DETACH
+ * and WALK_DETACH_TICKS above). */
+static walk_dir_t walk_detach_dir = WALK_DIR_DOWN;
 
 /* CROSSING phase state: up to 2 candidate outward directions (see
  * walk_exit_dir_candidates), alternated a bounded number of rounds. */
@@ -1835,6 +1857,22 @@ static void walk_hold_only(uint8_t code)
     }
 }
 
+/* Post-crossing detach tail (see WALK_PHASE_DETACH's header comment):
+ * keep holding the crossing direction for the fixed tick tail, then end
+ * the walk arrived. Entered only from walk_pump's room-change preamble. */
+static void walk_pump_detach(void)
+{
+    uint8_t code;
+    if (--walk_detach_ticks_left <= 0) { walk_cancel(WALK_ARRIVED); return; }
+    switch (walk_detach_dir) {
+        case WALK_DIR_UP:    code = walk_key_up;    break;
+        case WALK_DIR_DOWN:  code = walk_key_down;  break;
+        case WALK_DIR_LEFT:  code = walk_key_left;  break;
+        default:             code = walk_key_right; break;
+    }
+    walk_hold_only(code);
+}
+
 /* Does direction `d`, taken from exit tile (ex,ey), lead off the current
  * room's grid or into a non-walkable (void/wall) neighbor cell? This is
  * the brief's geometry-only outward-direction test: the doorway's
@@ -2495,9 +2533,24 @@ static void walk_pump(void)
 
     /* Room change is success on every phase -- the walk got the prisoner
      * out of the room. This doubles as the CROSSING phase's actual
-     * success signal (see its header comment): reaching it there needs no
-     * phase-specific check of its own. */
-    if (guybrush[current_nation].room != walk_room) { walk_cancel(WALK_ARRIVED); return; }
+     * success signal (see its header comment). A CROSS-phase change does
+     * not end the walk immediately though: it rolls into the short
+     * WALK_PHASE_DETACH tail (see its header comment) so the prisoner
+     * clears the doorway's mask zone before arrived is reported. Any
+     * other phase (or a second change during the tail) ends the walk
+     * arrived as before. */
+    if (guybrush[current_nation].room != walk_room) {
+        if (walk_phase == WALK_PHASE_CROSS) {
+            walk_room = guybrush[current_nation].room;
+            walk_detach_dir = walk_cross_cand[walk_cross_idx];
+            walk_detach_ticks_left = WALK_DETACH_TICKS;
+            walk_phase = WALK_PHASE_DETACH;
+            walk_release_keys();
+        } else {
+            walk_cancel(WALK_ARRIVED);
+            return;
+        }
+    }
 
     /* Auto-run kicker (see WALK_RUN_KICK_INTERVAL's header comment):
      * PATH and CROSS phases only. ITEM_PIXEL is deliberately excluded --
@@ -2516,6 +2569,7 @@ static void walk_pump(void)
             enqueue_key(KEY_TOGGLE_WALK_RUN, 100);
     }
 
+    if (walk_phase == WALK_PHASE_DETACH)     { walk_pump_detach();     return; }
     if (walk_phase == WALK_PHASE_CROSS)      { walk_pump_cross();      return; }
     if (walk_phase == WALK_PHASE_SIDESTEP)   { walk_pump_sidestep();   return; }
     if (walk_phase == WALK_PHASE_ITEM_PIXEL) { walk_pump_item_pixel(); return; }
