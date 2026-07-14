@@ -1178,6 +1178,24 @@ typedef enum { WALK_DIR_UP, WALK_DIR_DOWN, WALK_DIR_LEFT, WALK_DIR_RIGHT } walk_
  * so it can't fight input_pump's own one-key-at-a-time bookkeeping. */
 #define WALK_DOOR_TAP_INTERVAL 10   /* ~0.16s between taps */
 #define WALK_DOOR_TAP_MS 100
+
+/* Auto-run (user mandate: prisoners always run when able). The engine's
+ * walk/run toggle (main.c:703-723) only registers while the walk/run
+ * animation is actually playing, only upgrades to run when fatigue <
+ * MAX_FATIGUE, and resets speed to 1 in several places -- so a single
+ * kick at walk start is not enough. Instead every walk phase gets a
+ * periodic kicker in walk_pump's shared preamble: every
+ * WALK_RUN_KICK_INTERVAL ticks, if the prisoner is moving at walk speed
+ * (speed == 1) with fatigue headroom and not tunneling, tap
+ * KEY_TOGGLE_WALK_RUN through the ordinary input queue. The speed == 2
+ * check is what makes this safe: we never tap while already running, so
+ * the toggle can't flip run back off; and a tap that lands while
+ * stationary is discarded by the engine's own animation-index check (a
+ * no-op, not a deferred toggle). Disable per-walk with "run":false. */
+#define WALK_RUN_KICK_INTERVAL 15   /* ~0.24s between kicks while at walk speed */
+static bool walk_auto_run = true;
+static int walk_run_kick_ticks = 0;
+
 static walk_dir_t walk_cross_cand[2];
 static int walk_cross_ncand = 0;
 static int walk_cross_idx = 0;
@@ -2481,6 +2499,23 @@ static void walk_pump(void)
      * phase-specific check of its own. */
     if (guybrush[current_nation].room != walk_room) { walk_cancel(WALK_ARRIVED); return; }
 
+    /* Auto-run kicker (see WALK_RUN_KICK_INTERVAL's header comment):
+     * PATH and CROSS phases only. ITEM_PIXEL is deliberately excluded --
+     * its pickup tap goes through the same one-at-a-time input queue, so
+     * a run-toggle sitting in the queue at arrival would silently eat the
+     * pickup (seen live as a 1-in-6 suite flake), and pixel-window
+     * steering doesn't want 2px/tick motion anyway. SIDESTEP is excluded
+     * for the same close-quarters reason. */
+    if (walk_auto_run &&
+        (walk_phase == WALK_PHASE_PATH || walk_phase == WALK_PHASE_CROSS) &&
+        ++walk_run_kick_ticks >= WALK_RUN_KICK_INTERVAL) {
+        walk_run_kick_ticks = 0;
+        if (guybrush[current_nation].speed == 1 &&
+            p_event[current_nation].fatigue < MAX_FATIGUE &&
+            !(guybrush[current_nation].state & STATE_TUNNELING))
+            enqueue_key(KEY_TOGGLE_WALK_RUN, 100);
+    }
+
     if (walk_phase == WALK_PHASE_CROSS)      { walk_pump_cross();      return; }
     if (walk_phase == WALK_PHASE_SIDESTEP)   { walk_pump_sidestep();   return; }
     if (walk_phase == WALK_PHASE_ITEM_PIXEL) { walk_pump_item_pixel(); return; }
@@ -3090,6 +3125,13 @@ static void handle_walk(int cfd, const char* body)
     walk_tailgate_camping = false;
     walk_tailgate_deadline_ticks = has_tailgate
         ? (int)(tailgate_timeout_s * 1000 / 16) : 0;
+    /* Auto-run: on for every walk unless the request says "run":false
+     * (see WALK_RUN_KICK_INTERVAL's header comment). */
+    {
+        const char* rp = body ? strstr(body, "\"run\"") : NULL;
+        walk_auto_run = !(rp && strstr(rp, "false"));
+    }
+    walk_run_kick_ticks = 0;
     walk_phase = WALK_PHASE_PATH;
     walk_recovery_count = 0;
     walk_total_ticks = 0;
